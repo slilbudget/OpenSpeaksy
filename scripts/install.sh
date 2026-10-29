@@ -139,6 +139,8 @@ Using it
   Hold right Shift                     speak Russian, paste English
   Caps Lock                            cancel a stuck transcription
 
+  Words it mishears: cp vocabulary.example.txt vocabulary.txt and list them
+
   Logs:    tail -f ~/Library/Logs/com.openspeaksy/main.log
   Stop:    launchctl unload ~/Library/LaunchAgents/com.openspeaksy.plist
   Remove:  ./scripts/uninstall.sh

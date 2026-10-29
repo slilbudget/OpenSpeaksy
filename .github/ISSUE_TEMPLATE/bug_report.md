@@ -23,7 +23,7 @@ labels: bug
 
 - macOS version:
 - Mac model (M1 / M2 / M3 / Intel):
-- STT model: <!-- for example voxtral-mini-2602 -->
+- STT model: <!-- for example voxtral-small-transcribe-3 -->
 - Python version: <!-- output of `venv/bin/python --version` -->
 
 ## Logs

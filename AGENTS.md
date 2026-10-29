@@ -12,7 +12,7 @@
 
 ## Code
 
-`main.py` (state machine, keys, paste, watchdog, recovery), `transcriber.py` (Mistral STT + translation), `overlay.py` (pill), `recorder.py`, `launchd/com.openspeaksy.plist.template`. Tests: `./venv/bin/python -m pytest`.
+`main.py` (state machine, keys, paste, watchdog, recovery), `transcriber.py` (Mistral STT, translation, vocabulary, command mood), `overlay.py` (pill), `recorder.py`, `launchd/com.openspeaksy.plist.template`. Tests: `./venv/bin/python -m pytest`.
 
 Invariants that are easy to break:
 
@@ -24,6 +24,10 @@ Invariants that are easy to break:
 - **Audio** is written atomically to `.pending/` (0700/0600) before any request; the mode is in the filename. Recovery copies to the clipboard, never pastes, and runs before the tap starts.
 - **Retries**: `_pending_failures` (quarantine, ignores outages), `_pending_attempt_count` (backoff) and `_pending_next_attempt` are separate on purpose. EPIPE/ECONNRESET/ETIMEDOUT/ENOTCONN are `ProviderUnavailableError`: pause, don't count.
 - **Mistral errors**: read the body, not `str(HTTPError)`, and only through the cached `_http_error_text`. 429 code `1300` = quota, fail fast; `3505` = capacity, wait it out. Chat calls use `retry_throttling=False`.
+- **Vocabulary**: `vocabulary.txt` (gitignored) feeds Voxtral `context_bias` (max 100; a comma is HTTP 400 for the whole request, and so is whitespace on Transcribe 2 models, `_ONE_WORD_BIAS_MODELS`) plus `heard => written` whole-word fixes (one pass) and `term = meaning` glossary lines for the translator. Reloaded on mtime change; a missing or broken file never fails a dictation. Write terms in the script they are spoken in: Latin terms barely steer Russian audio.
+- **Timeouts** grow with the input (`TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN`, `CHAT_TIMEOUT_CHARS_PER_SEC`): the server is silent while it works, and a 20 min take outlasts the flat 30 s.
+- **Command mood** (`OPENSPEAKSY_COMMAND_MOOD`, off by default): `_as_commands` turns a first-person verb into the imperative per sentence; "я" anywhere in the sentence or `_NOT_A_COMMAND_BEFORE` within three words keeps it. Runs before the vocabulary fixes.
+- **Translation**: the dictation goes inside `<dictation>` tags (`_dictation_message`), or small models answer questions instead of translating them. `mistral-large-4` reasons on every call: `reasoning_effort` goes only to `_REASONING_MODEL_PREFIXES` (others answer 400), and its reply is a list of blocks (`_chat_text`). A failed call falls back once to `MISTRAL_TRANSLATION_FALLBACK_MODEL`, never on `ProviderUnavailableError`.
 - **Silence** is judged by `wav_has_speech` (loudest 100 ms), not average level.
 - **Plist env overrides code defaults.** Changing a model means both places.
 - Log lengths, paths and errors only. Never transcripts, never the key. No `print()`.

@@ -85,7 +85,7 @@ def test_a_cancelled_recording_is_not_retried(app, monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda p, language=None: calls.append(p) or "text ",
     )
 
@@ -102,7 +102,7 @@ def test_a_second_tap_puts_it_back_in_the_queue(app, monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda p, language=None: calls.append(p) or "text ",
     )
 
@@ -126,7 +126,7 @@ def test_cancelling_a_live_job_makes_its_worker_abort(app, monkeypatch, tmp_path
     monkeypatch.setattr(main, "current_wav_path", wav)
     pasted = []
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "late text "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "late text "
     )
     monkeypatch.setattr(main, "paste_text", lambda t: pasted.append(t) or True)
 

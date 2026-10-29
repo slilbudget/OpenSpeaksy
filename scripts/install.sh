@@ -136,7 +136,8 @@ Using it
 
   Hold right Command or right Option   dictate
   Both together                        dictate hands-free; tap either to stop
-  Hold right Shift          speak Russian, paste English
+  Hold right Shift                     speak Russian, paste English
+  Caps Lock                            cancel a stuck transcription
 
   Logs:    tail -f ~/Library/Logs/com.openspeaksy/main.log
   Stop:    launchctl unload ~/Library/LaunchAgents/com.openspeaksy.plist

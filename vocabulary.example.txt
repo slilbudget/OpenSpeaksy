@@ -1,0 +1,17 @@
+# Copy to vocabulary.txt (gitignored) and list the words OpenSpeaksy mishears.
+# Edits apply on the next dictation, no restart.
+#
+# A plain line is a term the recognizer should expect, written the way you
+# want it typed. No commas, at most 100. Phrases with spaces work on the
+# default model; the older voxtral-mini-2602 takes single words only.
+Kubernetes
+PostgreSQL
+кубер
+деплой
+
+# "heard => written" rewrites a word that still comes out wrong.
+# Whole words only, any case. Spaces are fine on both sides.
+пост грес => Postgres
+
+# "term = meaning" tells the translator (right Shift) what your jargon means.
+кубер = Kubernetes

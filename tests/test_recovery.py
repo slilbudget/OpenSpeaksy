@@ -5,7 +5,7 @@ class StubTranscriber:
     def __init__(self, *, text=None):
         self.text = text
 
-    def transcribe_and_correct_sync(self, path, language=None):
+    def transcribe_dictation_sync(self, path, language=None):
         return self.text
 
 
@@ -29,7 +29,7 @@ def test_recovery_stops_after_provider_failure_to_unblock_hotkeys(
     calls = []
 
     class FailingTranscriber:
-        def transcribe_and_correct_sync(self, path, language=None):
+        def transcribe_dictation_sync(self, path, language=None):
             calls.append(path)
             raise main.ProviderUnavailableError("nodename nor servname")
 

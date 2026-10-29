@@ -10,6 +10,7 @@ import pytest
 
 import main
 from transcriber import (
+    NothingRecognizedError,
     ProviderUnavailableError,
     RequestRejectedError,
     TranscriptionError,
@@ -68,7 +69,7 @@ def test_a_rejected_recording_is_quarantined_not_retried_forever(
     wav = _wav(tmp_path / "20260827-000000-abc.dictate.wav")
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda *a, **k: (_ for _ in ()).throw(
             RequestRejectedError("recording is too large for Mistral upload")
         ),
@@ -81,13 +82,35 @@ def test_a_rejected_recording_is_quarantined_not_retried_forever(
     assert ("error", "Recording is too long to transcribe") in worker.events
 
 
+def test_a_take_with_nothing_recognized_is_set_aside_quietly(
+    worker, monkeypatch, tmp_path
+):
+    """
+    A click loud enough to pass the speech check, for which the provider keeps
+    returning no text, used to sit behind an error pill for 9 minutes of
+    retries. It goes straight to quarantine, audio kept, with a plain notice.
+    """
+    wav = _wav(tmp_path / "20261029-000000-abc.dictate.wav")
+    monkeypatch.setattr(
+        main.transcriber,
+        "transcribe_dictation_sync",
+        lambda *a, **k: (_ for _ in ()).throw(NothingRecognizedError("empty")),
+    )
+
+    main.process_pending_recording(wav, 7, main.MODE_DICTATE)
+
+    assert not wav.exists()
+    assert (tmp_path / "quarantine" / wav.name).exists()
+    assert ("error", "Nothing recognized") in worker.events
+
+
 def test_a_transient_failure_keeps_the_recording_for_retry(
     worker, monkeypatch, tmp_path
 ):
     wav = _wav(tmp_path / "20260827-000001-abc.dictate.wav")
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda *a, **k: (_ for _ in ()).throw(
             ProviderUnavailableError("[Errno 8] nodename nor servname provided")
         ),
@@ -113,7 +136,7 @@ def test_the_worker_hides_only_its_own_overlay_cycle(worker, monkeypatch, tmp_pa
     """
     wav = _wav(tmp_path / "20260827-000002-abc.dictate.wav")
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "text "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "text "
     )
     monkeypatch.setattr(main, "paste_text", lambda text: True)
 
@@ -127,7 +150,7 @@ def test_a_stale_worker_touches_nothing(worker, monkeypatch, tmp_path):
     wav = _wav(tmp_path / "20260827-000003-abc.dictate.wav")
     pasted = []
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "text "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "text "
     )
     monkeypatch.setattr(main, "paste_text", lambda text: pasted.append(text) or True)
 
@@ -169,7 +192,7 @@ def test_recovery_leaves_the_live_workers_recording_alone(
         seen.append(path)
         return "recovered "
 
-    monkeypatch.setattr(main.transcriber, "transcribe_and_correct_sync", _transcribe)
+    monkeypatch.setattr(main.transcriber, "transcribe_dictation_sync", _transcribe)
 
     main.recover_pending_recordings()
 
@@ -190,7 +213,7 @@ def test_recovery_quarantines_a_payload_the_provider_refuses(
             raise RequestRejectedError("recording is too large")
         return "fine "
 
-    monkeypatch.setattr(main.transcriber, "transcribe_and_correct_sync", _transcribe)
+    monkeypatch.setattr(main.transcriber, "transcribe_dictation_sync", _transcribe)
 
     main.recover_pending_recordings()
 
@@ -215,7 +238,7 @@ def test_recovery_does_not_hold_the_clipboard_gate_across_the_network(
         held_during_network.append(main._clipboard_gate.locked())
         return "text "
 
-    monkeypatch.setattr(main.transcriber, "transcribe_and_correct_sync", _transcribe)
+    monkeypatch.setattr(main.transcriber, "transcribe_dictation_sync", _transcribe)
 
     main.recover_pending_recordings()
 
@@ -243,7 +266,7 @@ def test_a_recovery_clipboard_failure_keeps_every_recording(
 ):
     kept = _wav(tmp_path / "20260827-000014-a.dictate.wav")
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "text "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "text "
     )
     monkeypatch.setattr(
         main,
@@ -263,7 +286,7 @@ def test_the_gate_still_serializes_the_two_clipboard_writers(recovery, monkeypat
     """
     _wav(tmp_path / "20260827-000015-a.dictate.wav")
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "text "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "text "
     )
     observed = []
     monkeypatch.setattr(
@@ -281,7 +304,7 @@ def test_a_corrupt_wav_is_quarantined_not_transcribed(recovery, monkeypatch, tmp
     calls = []
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda *a, **k: calls.append(1) or "x ",
     )
 
@@ -321,7 +344,7 @@ def test_translate_mode_survives_recovery(recovery, monkeypatch, tmp_path):
     )
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("dictate path must not be used")
         ),
@@ -337,7 +360,7 @@ def test_processing_error_message_carries_the_providers_wait(worker, monkeypatch
     wav = _wav(tmp_path / "20260827-000020-a.dictate.wav")
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda *a, **k: (_ for _ in ()).throw(
             TranscriptionError(
                 "HTTP Error 429: Too Many Requests: Quota exceeded for metric: "

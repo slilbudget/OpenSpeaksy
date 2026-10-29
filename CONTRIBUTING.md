@@ -56,7 +56,7 @@ instead of retrying a request the provider will always refuse.
 Open an issue with:
 
 - macOS version + Apple Silicon / Intel
-- STT model (`voxtral-mini-2602` by default)
+- STT model (`voxtral-small-transcribe-3` by default)
 - Reproduction steps
 - Relevant lines from `~/Library/Logs/com.openspeaksy/main.log`
 

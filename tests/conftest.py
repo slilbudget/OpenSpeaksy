@@ -8,6 +8,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
 @pytest.fixture(autouse=True)
+def _no_personal_vocabulary(monkeypatch, tmp_path):
+    """
+    The user's own vocabulary.txt sits in the project root on a dev machine.
+    Tests that reload transcriber would pick it up and send extra form fields,
+    so point every test at a file that does not exist. The env var survives
+    importlib.reload, a patched module constant would not.
+    """
+    import transcriber
+
+    missing = str(tmp_path / "no-vocabulary.txt")
+    monkeypatch.setenv("OPENSPEAKSY_VOCABULARY", missing)
+    monkeypatch.setattr(transcriber, "VOCABULARY_PATH", missing)
+
+
+@pytest.fixture(autouse=True)
 def _reset_pending_retry_state():
     """
     The pending failure counts and the backoff schedule are module globals, so

@@ -18,9 +18,9 @@
         <key>MISTRAL_API_KEY</key>
         <string>__MISTRAL_API_KEY__</string>
         <key>MISTRAL_MODEL</key>
-        <string>voxtral-mini-2602</string>
+        <string>voxtral-small-transcribe-3</string>
         <key>MISTRAL_TRANSLATION_MODEL</key>
-        <string>ministral-8b-latest</string>
+        <string>mistral-large-4</string>
         <key>OPENSPEAKSY_DICTATE_LANGUAGE</key>
         <string></string>
     </dict>

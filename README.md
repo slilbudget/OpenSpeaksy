@@ -49,10 +49,13 @@ Optional, in `~/Library/LaunchAgents/com.openspeaksy.plist` → `EnvironmentVari
 | Variable | Default | |
 |:---|:---|:---|
 | `OPENSPEAKSY_DICTATE_LANGUAGE` | auto | Force a language, e.g. `en` |
-| `MISTRAL_MODEL` | `voxtral-mini-2602` | Speech-to-text model |
-| `MISTRAL_TRANSLATION_MODEL` | `ministral-8b-latest` | Translation model |
+| `MISTRAL_MODEL` | `voxtral-small-transcribe-3` | Speech-to-text model |
+| `MISTRAL_TRANSLATION_MODEL` | `mistral-large-4` | Translation model. Falls back to `ministral-8b-latest` on failure |
+| `OPENSPEAKSY_COMMAND_MOOD` | `0` | `1`: Russian "проверю" → "проверь" unless the sentence has "я" or a "не"/"если" before it. For dictating to AI agents |
 
 Apply with `launchctl unload` then `launchctl load` on that plist.
+
+**Vocabulary.** Jargon, slang or names it mishears: copy [`vocabulary.example.txt`](vocabulary.example.txt) to `vocabulary.txt` and list them, one per line. A `heard => written` line fixes a word that still comes out wrong; a `term = meaning` line tells the translator what your jargon means. Applies on the next dictation.
 
 ## Privacy
 

@@ -33,24 +33,24 @@ from PyObjCTools import AppHelper
 
 from recorder import Recorder
 from transcriber import (
-    CORRECT_DICTATION,
     is_capacity_shortage,
     loudest_frame_rms,
     DICTATE_LANGUAGE,
     MISTRAL_API_KEY,
-    MISTRAL_CORRECTION_MODEL,
     MISTRAL_MODEL,
     MISTRAL_TRANSLATION_MODEL,
     Transcriber,
     TranscriptionError,
     ProviderUnavailableError,
+    NothingRecognizedError,
     RequestRejectedError,
     write_wav,
 )
 from overlay import Overlay
 
-# Hotkey configuration. Default is right Command.
-# To use a different modifier, change both constants — see README for keycode/flag table.
+# Hotkeys: right Command and right Option dictate, right Shift translates. Each
+# needs its keycode and its device-dependent flag (right and left share the
+# generic modifier flag).
 HOTKEY_KEYCODE   = 0x36   # right Command
 HOTKEY_FLAG      = 0x10   # NX_DEVICERCMDKEYMASK — distinguishes right Cmd from left
 TRANSLATE_KEYCODE = 0x3C  # right Shift — dictate Russian, paste English
@@ -754,6 +754,8 @@ def error_notice(error, retry_in=None):
     Without that, a passing network blip reads as a lost dictation and the
     user re-records something the app is about to deliver anyway.
     """
+    if isinstance(error, NothingRecognizedError):
+        return "Nothing recognized"
     text = str(error).strip()
     if not text:
         return _with_retry("Transcription failed", retry_in)
@@ -804,7 +806,7 @@ def process_pending_recording(path, job_id, mode):
         if mode == MODE_TRANSLATE:
             text = transcriber.transcribe_and_translate_sync(path)
         else:
-            text = transcriber.transcribe_and_correct_sync(path, language=DICTATE_LANGUAGE)
+            text = transcriber.transcribe_dictation_sync(path, language=DICTATE_LANGUAGE)
     except RequestRejectedError as e:
         # Unacceptable to the provider as-is, so a retry is guaranteed to fail
         # the same way. Keeping it pending would burn a quota slot every
@@ -931,7 +933,7 @@ def recover_pending_recordings():
             if mode == MODE_TRANSLATE:
                 text = transcriber.transcribe_and_translate_sync(path)
             else:
-                text = transcriber.transcribe_and_correct_sync(path, language=DICTATE_LANGUAGE)
+                text = transcriber.transcribe_dictation_sync(path, language=DICTATE_LANGUAGE)
         except ProviderUnavailableError as e:
             # The network is out, not this file's fault, so it must NOT count
             # toward quarantine. Put the rest of the queue on the backoff and
@@ -973,7 +975,7 @@ def recover_pending_recordings():
     if skipped:
         log(
             f"recovery skipped {skipped} recording(s) with file-specific "
-            "errors; they stay in .pending"
+            "errors; each is either scheduled for a retry or quarantined"
         )
 
     if non_empty:
@@ -1480,9 +1482,7 @@ def main():
     log(
         f"OpenSpeaksy starting — primary STT: {stt}; "
         f"dictate language: {DICTATE_LANGUAGE or 'auto'}; "
-        f"translation backend: {translator}; "
-        f"dictation correction: "
-        f"{f'Mistral {MISTRAL_CORRECTION_MODEL}' if CORRECT_DICTATION else 'off'}"
+        f"translation backend: {translator}"
     )
     microphone_status = microphone_authorization_status()
     if microphone_status in {

@@ -63,7 +63,7 @@ def test_an_empty_transcript_of_room_noise_is_accepted_once(monkeypatch, tmp_pat
     monkeypatch.setattr(transcriber, "MISTRAL_API_KEY", "k")
 
     with patch.object(transcriber, "urlopen", return_value=_Response("")) as urlopen:
-        assert Transcriber().transcribe_and_correct_sync(wav) == ""
+        assert Transcriber().transcribe_dictation_sync(wav) == ""
 
     assert urlopen.call_count == 1
 
@@ -115,3 +115,47 @@ def test_the_loudest_empty_take_measured_is_still_silence(tmp_path):
     audio[8000:9600] += 0.0053 * np.sqrt(2) * np.sin(np.linspace(0, 200 * np.pi, 1600))
     write_wav(audio, wav)
     assert not wav_has_speech(wav)
+
+
+def test_a_long_recording_gets_a_longer_socket_wait(tmp_path, monkeypatch):
+    # The server is silent while it transcribes; a 20 min take needs well over
+    # the flat 30 s, or every attempt times out and the take never lands.
+    monkeypatch.setattr(transcriber, "MISTRAL_API_KEY", "mistral-test-key")
+    timeouts = []
+
+    class _Resp:
+        def read(self):
+            return b'{"text": "ok"}'
+
+    def fake_urlopen(req, timeout):
+        timeouts.append(timeout)
+        return _Resp()
+
+    for minutes in (0.1, 20):
+        wav = str(tmp_path / f"{minutes}.wav")
+        transcriber.write_wav(np.full(int(minutes * 60 * 16000), 0.1, np.float32), wav)
+        with patch.object(transcriber, "urlopen", side_effect=fake_urlopen):
+            transcriber.Transcriber()._transcribe_mistral(wav)
+
+    assert timeouts[0] < 31
+    assert timeouts[1] >= 85
+
+
+def test_no_text_for_loud_audio_ends_as_nothing_recognized(tmp_path, monkeypatch):
+    monkeypatch.setattr(transcriber, "MISTRAL_API_KEY", "mistral-test-key")
+    monkeypatch.setattr(transcriber, "RETRY_DELAYS_SEC", (0, 0))
+    wav = str(tmp_path / "click.wav")
+    write_wav(np.full(16000, 0.1, np.float32), wav)
+
+    class _Empty:
+        def read(self):
+            return b'{"text": ""}'
+
+    with patch.object(transcriber, "urlopen", return_value=_Empty()) as mock:
+        try:
+            Transcriber().transcribe_dictation_sync(wav)
+            raise AssertionError("expected NothingRecognizedError")
+        except transcriber.NothingRecognizedError:
+            pass
+    # The quick in-request retries still happen: a provider blip gets its chance.
+    assert mock.call_count == transcriber.REQUEST_MAX_ATTEMPTS

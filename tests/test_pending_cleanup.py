@@ -18,7 +18,7 @@ class StubTranscriber:
         self.error = error
         self.calls = 0
 
-    def transcribe_and_correct_sync(self, path, language=None):
+    def transcribe_dictation_sync(self, path, language=None):
         self.calls += 1
         if self.error:
             raise self.error

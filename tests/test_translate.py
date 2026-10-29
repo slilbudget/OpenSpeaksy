@@ -11,8 +11,8 @@ from urllib.error import HTTPError
 import pytest
 
 
-def _http_error(code):
-    return HTTPError("https://api.mistral.ai/", code, "test", {}, io.BytesIO(b""))
+def _http_error(code, body=b""):
+    return HTTPError("https://api.mistral.ai/", code, "test", {}, io.BytesIO(body))
 
 
 def _ok_transcribe(text):
@@ -111,7 +111,77 @@ def test_translate_mistral_posts_chat_completions(transcriber_module):
     msgs = captured["body"]["messages"]
     assert msgs[0]["role"] == "system"
     assert "Russian" in msgs[0]["content"] and "English" in msgs[0]["content"]
-    assert msgs[1] == {"role": "user", "content": "Привет мир"}
+    # The dictation is fenced off so a question or command is translated, not answered.
+    assert msgs[1]["role"] == "user"
+    assert "<dictation>\nПривет мир\n</dictation>" in msgs[1]["content"]
+    assert captured["body"]["reasoning_effort"] == "low"
+
+
+def test_reasoning_effort_goes_only_to_reasoning_models(transcriber_module):
+    t = transcriber_module
+    bodies = []
+
+    def fake_urlopen(req, timeout):
+        bodies.append(json.loads(req.data.decode()))
+        return _ok_chat("ok")
+
+    with patch.object(t, "urlopen", side_effect=fake_urlopen):
+        t.Transcriber()._chat_completion("sys", "x", label="t", model="ministral-8b-latest")
+        t.Transcriber()._chat_completion("sys", "x", label="t", model="mistral-large-4")
+    assert "reasoning_effort" not in bodies[0]
+    assert bodies[1]["reasoning_effort"] == "low"
+
+
+def test_reasoning_reply_blocks_are_read_as_text(transcriber_module):
+    t = transcriber_module
+    reply = {"choices": [{"message": {"content": [
+        {"type": "thinking", "thinking": [{"type": "text", "text": "hmm"}]},
+        {"type": "text", "text": "Hello"},
+    ]}}]}
+    assert t._chat_text(reply) == "Hello"
+
+
+def test_a_failed_translation_falls_back_once(transcriber_module):
+    t = transcriber_module
+    models = []
+
+    def fake_urlopen(req, timeout):
+        model = json.loads(req.data.decode())["model"]
+        models.append(model)
+        if model == t.MISTRAL_TRANSLATION_MODEL:
+            raise _http_error(429)
+        return _ok_chat("Hello")
+
+    with patch.object(t, "urlopen", side_effect=fake_urlopen):
+        assert t.Transcriber()._translate_mistral("Привет") == "Hello"
+    assert models == [t.MISTRAL_TRANSLATION_MODEL, t.MISTRAL_TRANSLATION_FALLBACK_MODEL]
+
+
+def test_no_fallback_without_a_network(transcriber_module):
+    t = transcriber_module
+    with patch.object(
+        t.Transcriber, "_chat_completion", side_effect=t.ProviderUnavailableError("offline")
+    ) as chat:
+        with pytest.raises(t.ProviderUnavailableError):
+            t.Transcriber()._translate_mistral("Привет")
+    assert chat.call_count == 1
+
+
+def test_the_glossary_reaches_the_translator(transcriber_module, tmp_path, monkeypatch):
+    t = transcriber_module
+    vocabulary = tmp_path / "vocabulary.txt"
+    vocabulary.write_text("пвашки = PWA apps\nкинг\n", encoding="utf-8")
+    monkeypatch.setattr(t, "VOCABULARY_PATH", str(vocabulary))
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["system"] = json.loads(req.data.decode())["messages"][0]["content"]
+        return _ok_chat("ok")
+
+    with patch.object(t, "urlopen", side_effect=fake_urlopen):
+        t.Transcriber()._translate_mistral("пвашки")
+    assert "пвашки = PWA apps" in captured["system"]
+    assert "кинг" not in captured["system"]
 
 
 def test_translate_429_propagates(transcriber_module):
@@ -173,7 +243,7 @@ def test_transcribe_and_translate_happy_path(transcriber_module, tmp_path):
         result = t.Transcriber().transcribe_and_translate_sync(wav)
 
     # Translator must see the clean Russian (no trailing space from transcribe_wav_sync)
-    assert captured_msgs["user"] == "Как дела?"
+    assert "<dictation>\nКак дела?\n</dictation>" in captured_msgs["user"]
     # Final output has the trailing space matching dictate-path convention
     assert result == "How are you? "
 
@@ -276,3 +346,47 @@ def test_a_translation_of_only_a_full_stop_pastes_nothing(
 
     with patch.object(t, "urlopen", side_effect=fake_urlopen):
         assert t.Transcriber().transcribe_and_translate_sync(wav) == ""
+
+
+def test_a_long_text_gets_a_longer_wait(transcriber_module):
+    t = transcriber_module
+    timeouts = []
+
+    def fake_urlopen(req, timeout):
+        timeouts.append(timeout)
+        return _ok_chat("ok")
+
+    with patch.object(t, "urlopen", side_effect=fake_urlopen):
+        t.Transcriber()._chat_completion("sys", "x", label="t")
+        t.Transcriber()._chat_completion("sys", "x" * 20000, label="t")
+    assert timeouts[0] < 31
+    assert timeouts[1] >= 100
+
+
+def test_a_busy_primary_hands_over_at_once(transcriber_module):
+    t = transcriber_module
+    models = []
+
+    def fake_urlopen(req, timeout):
+        model = json.loads(req.data.decode())["model"]
+        models.append(model)
+        if model == t.MISTRAL_TRANSLATION_MODEL:
+            raise _http_error(429, b'{"code": "3505", "type": "backend_out_of_capacity"}')
+        return _ok_chat("Hello")
+
+    with patch.object(t, "urlopen", side_effect=fake_urlopen), patch.object(t.time, "sleep") as sleep:
+        assert t.Transcriber()._translate_mistral("Привет") == "Hello"
+    assert models == [t.MISTRAL_TRANSLATION_MODEL, t.MISTRAL_TRANSLATION_FALLBACK_MODEL]
+    sleep.assert_not_called()
+
+
+def test_a_rejected_key_does_not_try_the_fallback(transcriber_module):
+    t = transcriber_module
+    with patch.object(t, "urlopen", side_effect=_http_error(401)) as mock:
+        with pytest.raises(t.TranscriptionError):
+            t.Transcriber()._translate_mistral("Привет")
+    assert mock.call_count == 1
+
+
+def test_an_echoed_fence_is_not_pasted(transcriber_module):
+    assert transcriber_module._finish_translation("<dictation>\nHello.\n</dictation>") == "Hello"

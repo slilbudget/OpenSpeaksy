@@ -102,7 +102,7 @@ def test_a_scheduled_file_is_skipped_until_it_comes_due(recovery, monkeypatch, t
         calls.append(path)
         raise ProviderUnavailableError("[Errno 32] Broken pipe")
 
-    monkeypatch.setattr(main.transcriber, "transcribe_and_correct_sync", _transcribe)
+    monkeypatch.setattr(main.transcriber, "transcribe_dictation_sync", _transcribe)
 
     main.recover_pending_recordings()
     assert calls == [wav]
@@ -127,7 +127,7 @@ def test_a_network_outage_never_counts_toward_quarantine(
     wav = _wav(tmp_path / "20260922-000002-a.dictate.wav")
     monkeypatch.setattr(
         main.transcriber,
-        "transcribe_and_correct_sync",
+        "transcribe_dictation_sync",
         lambda *a, **k: (_ for _ in ()).throw(
             ProviderUnavailableError("[Errno 32] Broken pipe")
         ),
@@ -149,7 +149,7 @@ def test_a_recovered_transcript_announces_itself(recovery, monkeypatch, tmp_path
     """
     _wav(tmp_path / "20260922-000003-a.dictate.wav")
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "recovered "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "recovered "
     )
 
     main.recover_pending_recordings()
@@ -166,7 +166,7 @@ def test_a_failed_notice_still_lets_the_audio_be_released(
     strand the file it came from."""
     wav = _wav(tmp_path / "20260922-000004-a.dictate.wav")
     monkeypatch.setattr(
-        main.transcriber, "transcribe_and_correct_sync", lambda *a, **k: "recovered "
+        main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "recovered "
     )
 
     def _boom(*a, **k):

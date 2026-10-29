@@ -18,6 +18,6 @@ labels: enhancement
 
 ## Scope check
 
-- [ ] This does not add a new service or telemetry beyond the configured providers
+- [ ] This does not add a new service or telemetry beyond Mistral
 - [ ] This doesn't break the no-auto-paste-on-recovery invariant
 - [ ] This is macOS-focused (Windows/Linux ports go in [#1](https://github.com/slilbudget/OpenSpeaksy/issues/1))

@@ -24,9 +24,9 @@ logger = logging.getLogger("openspeaksy")
 REQUEST_TIMEOUT_SEC = 30
 # The server sends nothing while it transcribes, so the socket wait has to grow
 # with the recording. Measured 2026-10-29 on voxtral-small-transcribe-3: a
-# 19.8 min recording took 31.9 s end to end, already past the flat 30 s.
-# 3 s per minute of audio gives that one 90 s.
-TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN = 3.0
+# 19.8 min recording took 31.9 s end to end, already past the flat 30 s, and
+# 67 s the next day. 5 s per minute of audio gives that one 130 s.
+TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN = 5.0
 # The same for a chat call: mistral-large-4 translated 3.4k characters (about
 # 3 min of speech) in 8.2 s, so a 20 min take's text needs ~50 s. One second
 # per 200 characters leaves twice that.
@@ -112,11 +112,24 @@ COMMAND_MOOD = os.environ.get("OPENSPEAKSY_COMMAND_MOOD", "0").strip() == "1"
 # fail every dictation, so phrases are dropped when one of those is configured.
 CONTEXT_BIAS_MAX_TERMS = 100
 _ONE_WORD_BIAS_MODELS = {"voxtral-mini-2602", "voxtral-mini-latest", "voxtral-mini-2507"}
+# Transcribe 3 is in preview: measured 2026-10-30, voxtral-small-transcribe-3
+# with any context_bias (even 5 terms) hung past 130 s on a 5 min recording,
+# 3 times of 3, while 2-4 min took 8-13 s and the same 5 min without terms 11 s.
+# Longer takes go without terms; fixes and the glossary still apply.
+CONTEXT_BIAS_MAX_AUDIO_MIN = 4
 
 MISTRAL_API_KEY = os.environ.get("MISTRAL_API_KEY", "").strip()
 MISTRAL_ENDPOINT = "https://api.mistral.ai/v1/audio/transcriptions"
 MISTRAL_CHAT_ENDPOINT = "https://api.mistral.ai/v1/chat/completions"
 MISTRAL_MODEL = os.environ.get("MISTRAL_MODEL", "voxtral-small-transcribe-3")
+# Transcribe 3 is a preview: on 2026-11-09 this account's access to it dropped
+# to 0 requests/min without notice, and a dictation sat unrecognized in the
+# queue. A refused take goes to the stable Transcribe 2 model instead, and after
+# a quota or access refusal the primary is skipped for a while, so each
+# dictation does not pay for a request that is certain to fail.
+MISTRAL_FALLBACK_MODEL = os.environ.get("MISTRAL_FALLBACK_MODEL", "voxtral-mini-2602").strip()
+PRIMARY_STT_SKIP_SEC = 300
+_primary_stt_skip_until = 0.0
 # Measured 2026-10-29 on 18 dictations (jargon, commands, questions, injection
 # lines): mistral-large-4 was the only model with no wrong meaning ("крео
 # зашло" became "creatives are approved" on 8b, "tanking" on 14b), at a 1.8 s
@@ -358,7 +371,7 @@ def _retry_delay(error, attempt):
 
 def _request_json(
     request, label, validate=None, retry_throttling=True, timeout=None,
-    capacity_max_attempts=CAPACITY_MAX_ATTEMPTS,
+    capacity_max_attempts=CAPACITY_MAX_ATTEMPTS, request_max_attempts=REQUEST_MAX_ATTEMPTS,
 ):
     """
     Execute one provider request with bounded retries for transport failures,
@@ -383,7 +396,7 @@ def _request_json(
             elif capacity:
                 max_attempts = capacity_max_attempts
             else:
-                max_attempts = REQUEST_MAX_ATTEMPTS
+                max_attempts = request_max_attempts
             delay = _retry_delay(error, attempt)
             if (
                 not retry_throttling
@@ -786,18 +799,30 @@ class Transcriber:
         return lower in HALLUCINATIONS
 
     def transcribe_wav_sync(self, wav_path, language=None):
+        global _primary_stt_skip_until
         vocabulary = load_vocabulary()
-        try:
-            text = self._transcribe_mistral(
-                wav_path, language=language, terms=vocabulary.terms
-            )
-        except TranscriptionError as e:
-            # A term the endpoint refuses would fail every dictation until the
-            # file is edited. The vocabulary is optional; the take is not.
-            if not vocabulary.terms or getattr(e, "code", None) != 400:
-                raise
-            logger.warning("vocabulary terms rejected (HTTP 400), transcribing without them")
-            text = self._transcribe_mistral(wav_path, language=language)
+        fallback = MISTRAL_FALLBACK_MODEL if MISTRAL_FALLBACK_MODEL != MISTRAL_MODEL else ""
+        if fallback and time.monotonic() < _primary_stt_skip_until:
+            text = self._transcribe_with_terms(wav_path, language, vocabulary, fallback)
+        else:
+            try:
+                text = self._transcribe_with_terms(
+                    wav_path, language, vocabulary, MISTRAL_MODEL, fail_fast=bool(fallback)
+                )
+            except ProviderUnavailableError:
+                raise  # no network: the fallback would fail the same way
+            except TranscriptionError as e:
+                code = getattr(e, "code", None)
+                # A rejected key fails on every model; an oversized upload too.
+                if not fallback or code == 401 or (
+                    isinstance(e, RequestRejectedError)
+                    and not isinstance(e, NothingRecognizedError)
+                ):
+                    raise
+                if code == 403 or (code == 429 and not is_capacity_shortage(e)):
+                    _primary_stt_skip_until = time.monotonic() + PRIMARY_STT_SKIP_SEC
+                logger.warning(f"transcription on {MISTRAL_MODEL} failed, using {fallback}: {e}")
+                text = self._transcribe_with_terms(wav_path, language, vocabulary, fallback)
 
         # A phrase blocklist alone would silently discard legitimate dictation
         # such as "Thank you". Filter known model artifacts only when the WAV
@@ -810,6 +835,30 @@ class Transcriber:
         if text:
             text += " "
         return text
+
+    def _transcribe_with_terms(self, wav_path, language, vocabulary, model, fail_fast=False):
+        terms = vocabulary.terms
+        if model in _ONE_WORD_BIAS_MODELS:
+            terms = tuple(term for term in terms if " " not in term)
+        elif terms and (
+            # 16 kHz mono 16-bit: 32,000 bytes per second of audio.
+            os.path.getsize(wav_path) > CONTEXT_BIAS_MAX_AUDIO_MIN * 60 * 32000
+        ):
+            logger.info("long take: transcribing without vocabulary terms")
+            terms = ()
+        try:
+            return self._transcribe_mistral(
+                wav_path, language=language, terms=terms, model=model, fail_fast=fail_fast
+            )
+        except TranscriptionError as e:
+            # A term the endpoint refuses would fail every dictation until the
+            # file is edited. The vocabulary is optional; the take is not.
+            if not terms or getattr(e, "code", None) != 400:
+                raise
+            logger.warning("vocabulary terms rejected (HTTP 400), transcribing without them")
+            return self._transcribe_mistral(
+                wav_path, language=language, model=model, fail_fast=fail_fast
+            )
 
     def transcribe_dictation_sync(self, wav_path, language=None):
         return _finish_dictation(self.transcribe_wav_sync(wav_path, language=language))
@@ -828,7 +877,7 @@ class Transcriber:
             return ""
         return english + " "
 
-    def _transcribe_mistral(self, wav_path, language=None, terms=()):
+    def _transcribe_mistral(self, wav_path, language=None, terms=(), model=None, fail_fast=False):
         if not MISTRAL_API_KEY:
             raise TranscriptionError("Mistral API key is not configured")
 
@@ -844,7 +893,7 @@ class Transcriber:
                 f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB)"
             )
 
-        fields = [("model", MISTRAL_MODEL)]
+        fields = [("model", model or MISTRAL_MODEL)]
         if language:
             fields.append(("language", language))
         # One repeated form field per term is what the endpoint expects.
@@ -868,6 +917,11 @@ class Transcriber:
             validate=lambda result: _transcription_text(result, wav_path),
             timeout=REQUEST_TIMEOUT_SEC
             + audio_minutes * TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN,
+            # With a fallback model at hand, one refusal is enough: the other
+            # model gets the take at once instead of after the retry ladder.
+            retry_throttling=not fail_fast,
+            capacity_max_attempts=1 if fail_fast else CAPACITY_MAX_ATTEMPTS,
+            request_max_attempts=1 if fail_fast else REQUEST_MAX_ATTEMPTS,
         )
 
     def _translate_mistral(self, russian_text):

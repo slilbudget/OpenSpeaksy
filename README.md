@@ -49,7 +49,7 @@ Optional, in `~/Library/LaunchAgents/com.openspeaksy.plist` → `EnvironmentVari
 | Variable | Default | |
 |:---|:---|:---|
 | `OPENSPEAKSY_DICTATE_LANGUAGE` | auto | Force a language, e.g. `en` |
-| `MISTRAL_MODEL` | `voxtral-small-transcribe-3` | Speech-to-text model |
+| `MISTRAL_MODEL` | `voxtral-small-transcribe-3` | Speech-to-text model. Falls back to `voxtral-mini-2602` (`MISTRAL_FALLBACK_MODEL`) when refused |
 | `MISTRAL_TRANSLATION_MODEL` | `mistral-large-4` | Translation model. Falls back to `ministral-8b-latest` on failure |
 | `OPENSPEAKSY_COMMAND_MOOD` | `0` | `1`: Russian "проверю" → "проверь" unless the sentence has "я" or a "не"/"если" before it. For dictating to AI agents |
 

@@ -37,6 +37,7 @@ from transcriber import (
     loudest_frame_rms,
     DICTATE_LANGUAGE,
     MISTRAL_API_KEY,
+    MISTRAL_FALLBACK_MODEL,
     MISTRAL_MODEL,
     MISTRAL_TRANSLATION_MODEL,
     Transcriber,
@@ -1478,7 +1479,10 @@ def main():
         return
 
     translator = f"Mistral {MISTRAL_TRANSLATION_MODEL}"
-    stt = f"Mistral {MISTRAL_MODEL}"
+    stt = f"Mistral {MISTRAL_MODEL}" + (
+        f", fallback {MISTRAL_FALLBACK_MODEL}"
+        if MISTRAL_FALLBACK_MODEL and MISTRAL_FALLBACK_MODEL != MISTRAL_MODEL else ""
+    )
     log(
         f"OpenSpeaksy starting — primary STT: {stt}; "
         f"dictate language: {DICTATE_LANGUAGE or 'auto'}; "

@@ -28,6 +28,7 @@ Invariants that are easy to break:
 - **Timeouts** grow with the input (`TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN`, `CHAT_TIMEOUT_CHARS_PER_SEC`): the server is silent while it works, and a 20 min take outlasts the flat 30 s.
 - **Command mood** (`OPENSPEAKSY_COMMAND_MOOD`, off by default): `_as_commands` turns a first-person verb into the imperative per sentence; "я" anywhere in the sentence or `_NOT_A_COMMAND_BEFORE` within three words keeps it. Runs before the vocabulary fixes.
 - **Translation**: the dictation goes inside `<dictation>` tags (`_dictation_message`), or small models answer questions instead of translating them. `mistral-large-4` reasons on every call: `reasoning_effort` goes only to `_REASONING_MODEL_PREFIXES` (others answer 400), and its reply is a list of blocks (`_chat_text`). A failed call falls back once to `MISTRAL_TRANSLATION_FALLBACK_MODEL`, never on `ProviderUnavailableError`.
+- **STT fallback**: a refused primary (`fail_fast`: one attempt) hands the take to `MISTRAL_FALLBACK_MODEL` (Transcribe 2, one-word terms only); a quota/access refusal (429 code 1300, 403) skips the primary for `PRIMARY_STT_SKIP_SEC`. Never on 401, `ProviderUnavailableError` or an oversized upload.
 - **Silence** is judged by `wav_has_speech` (loudest 100 ms), not average level.
 - **Plist env overrides code defaults.** Changing a model means both places.
 - Log lengths, paths and errors only. Never transcripts, never the key. No `print()`.

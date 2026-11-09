@@ -20,6 +20,10 @@ def _no_personal_vocabulary(monkeypatch, tmp_path):
     missing = str(tmp_path / "no-vocabulary.txt")
     monkeypatch.setenv("OPENSPEAKSY_VOCABULARY", missing)
     monkeypatch.setattr(transcriber, "VOCABULARY_PATH", missing)
+    # Tests count requests to one model; the fallback tests opt back in.
+    monkeypatch.setenv("MISTRAL_FALLBACK_MODEL", "")
+    monkeypatch.setattr(transcriber, "MISTRAL_FALLBACK_MODEL", "")
+    monkeypatch.setattr(transcriber, "_primary_stt_skip_until", 0.0)
 
 
 @pytest.fixture(autouse=True)

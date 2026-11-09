@@ -5,7 +5,7 @@ class StubTranscriber(Transcriber):
     def __init__(self, text):
         self.text = text
 
-    def _transcribe_mistral(self, wav_path, language=None, terms=()):
+    def _transcribe_mistral(self, wav_path, language=None, terms=(), **kwargs):
         return self.text
 
 

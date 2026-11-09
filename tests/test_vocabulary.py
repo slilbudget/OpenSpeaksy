@@ -178,7 +178,7 @@ def test_a_rejected_term_list_does_not_lose_the_take(monkeypatch, tmp_path):
     rejected.code = 400
     calls = []
 
-    def fake(self, wav_path, language=None, terms=()):
+    def fake(self, wav_path, language=None, terms=(), **kwargs):
         calls.append(terms)
         if terms:
             raise rejected
@@ -199,3 +199,90 @@ def test_other_failures_are_not_retried_without_terms(monkeypatch, tmp_path):
         except transcriber.TranscriptionError:
             pass
     assert mock.call_count == 1
+
+
+def test_a_long_take_goes_without_terms_on_transcribe_3(monkeypatch, tmp_path):
+    monkeypatch.setattr(transcriber, "VOCABULARY_PATH", _vocab(tmp_path, "кинг\nотсеты => адсеты\n"))
+    sent = []
+
+    def fake(self, wav_path, language=None, terms=(), **kwargs):
+        sent.append(terms)
+        return "отсеты"
+
+    short = _speech_wav(tmp_path)
+    long = str(tmp_path / "long.wav")
+    minutes = transcriber.CONTEXT_BIAS_MAX_AUDIO_MIN + 0.1
+    write_wav(np.full(int(minutes * 60 * 16000), 0.1, np.float32), long)
+    with patch.object(Transcriber, "_transcribe_mistral", fake):
+        monkeypatch.setattr(transcriber, "MISTRAL_MODEL", "voxtral-small-transcribe-3")
+        assert Transcriber().transcribe_wav_sync(short) == "адсеты "
+        assert Transcriber().transcribe_wav_sync(long) == "адсеты "  # fixes still apply
+        # Transcribe 2 handled long takes with terms fine.
+        monkeypatch.setattr(transcriber, "MISTRAL_MODEL", "voxtral-mini-2602")
+        Transcriber().transcribe_wav_sync(long)
+    assert sent == [("кинг",), (), ("кинг",)]
+
+
+def _refusal(code, body=""):
+    error = transcriber.TranscriptionError(body or f"HTTP {code}")
+    error.code = code
+    return error
+
+
+def test_a_refused_primary_hands_the_take_to_the_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(transcriber, "MISTRAL_MODEL", "voxtral-small-transcribe-3")
+    monkeypatch.setattr(transcriber, "MISTRAL_FALLBACK_MODEL", "voxtral-mini-2602")
+    monkeypatch.setattr(transcriber, "VOCABULARY_PATH", _vocab(tmp_path, "кинг\nад аккаунт\n"))
+    calls = []
+
+    def fake(self, wav_path, language=None, terms=(), model=None, fail_fast=False):
+        calls.append((model, terms, fail_fast))
+        if model == "voxtral-small-transcribe-3":
+            raise _refusal(429, '{"code":"1300","type":"rate_limited"}')
+        return "текст"
+
+    wav = _speech_wav(tmp_path)
+    with patch.object(Transcriber, "_transcribe_mistral", fake):
+        assert Transcriber().transcribe_wav_sync(wav) == "текст "
+        # The primary is skipped while its access is refused.
+        assert Transcriber().transcribe_wav_sync(wav) == "текст "
+    assert calls == [
+        ("voxtral-small-transcribe-3", ("кинг", "ад аккаунт"), True),
+        # Transcribe 2 takes one-word terms only.
+        ("voxtral-mini-2602", ("кинг",), False),
+        ("voxtral-mini-2602", ("кинг",), False),
+    ]
+
+
+def test_a_busy_primary_falls_back_without_being_skipped(monkeypatch, tmp_path):
+    monkeypatch.setattr(transcriber, "MISTRAL_FALLBACK_MODEL", "voxtral-mini-2602")
+    models = []
+
+    def fake(self, wav_path, language=None, terms=(), model=None, fail_fast=False):
+        models.append(model)
+        if model == transcriber.MISTRAL_MODEL:
+            raise _refusal(429, '{"code":"3505","type":"backend_out_of_capacity"}')
+        return "текст"
+
+    wav = _speech_wav(tmp_path)
+    with patch.object(Transcriber, "_transcribe_mistral", fake):
+        Transcriber().transcribe_wav_sync(wav)
+        Transcriber().transcribe_wav_sync(wav)
+    # Capacity clears by itself, so the primary is tried again every time.
+    assert models == [transcriber.MISTRAL_MODEL, "voxtral-mini-2602"] * 2
+
+
+def test_no_fallback_for_a_bad_key_a_dead_network_or_a_huge_file(monkeypatch, tmp_path):
+    monkeypatch.setattr(transcriber, "MISTRAL_FALLBACK_MODEL", "voxtral-mini-2602")
+    wav = _speech_wav(tmp_path)
+    for error in (
+        _refusal(401),
+        transcriber.ProviderUnavailableError("offline"),
+        transcriber.RequestRejectedError("recording is too large"),
+    ):
+        with patch.object(Transcriber, "_transcribe_mistral", side_effect=error) as mock:
+            try:
+                Transcriber().transcribe_wav_sync(wav)
+            except transcriber.TranscriptionError:
+                pass
+        assert mock.call_count == 1, error

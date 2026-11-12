@@ -33,8 +33,7 @@ TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN = 5.0
 CHAT_TIMEOUT_CHARS_PER_SEC = 200
 # Refuse an upload this large before spending a round-trip on it. Measured
 # 2026-09-22: a 110 MB WAV (1 h of audio) is answered with 429 code 3505, the
-# same capacity
-# refusal a transient shortage gives — so the retry ladder would wait it out
+# same capacity refusal a transient shortage gives — so the retry ladder would wait it out
 # again and again, ~3 min per attempt, instead of setting it aside. The size
 # is the one signal that separates the two, and only this side can see it.
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
@@ -404,7 +403,7 @@ def _request_json(
     failures are deliberately not retried.
 
     Set retry_throttling=False when the caller has somewhere better to go on a
-    429 — rotating to another API key beats waiting out this one's window.
+    429 — falling back to another model beats waiting out this one's window.
     """
     # The loop bound is the widest ladder any error class can ask for; each
     # class then stops at its own max_attempts below.
@@ -976,7 +975,7 @@ class Transcriber:
             )
 
     def _chat_completion(
-        self, system_prompt, user_text, label, model=None, temperature=None,
+        self, system_prompt, user_text, label, model=None,
         capacity_max_attempts=CAPACITY_MAX_ATTEMPTS,
     ):
         if not MISTRAL_API_KEY:
@@ -984,9 +983,7 @@ class Transcriber:
         model = model or MISTRAL_TRANSLATION_MODEL
         body = {
             "model": model,
-            "temperature": (
-                TRANSLATION_TEMPERATURE if temperature is None else temperature
-            ),
+            "temperature": TRANSLATION_TEMPERATURE,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
@@ -1005,9 +1002,9 @@ class Transcriber:
                 "User-Agent": "openspeaksy/1.0",
             },
         )
-        # A 429 here is the account's own limit on a single key with nowhere
-        # to rotate to, so the three local attempts only stretch the failure
-        # and add load to the endpoint that just refused. Fail fast instead.
+        # A 429 here is the account's own limit, and retrying within seconds
+        # only stretches the failure and adds load to the endpoint that just
+        # refused. Fail fast: the caller falls back to another model.
         return _request_json(
             req,
             f"Mistral {label}",

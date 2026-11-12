@@ -3,7 +3,7 @@ A key-up event for a hotkey that did NOT start the current cycle must be
 ignored. Without this, tapping the other hotkey mid-record (e.g. right Option
 while holding right Command) would end the cycle and trigger transcription
 of a half-spoken phrase. The invariant is enforced by on_key_up checking
-current_hotkey before claiming the recording→processing transition.
+current_hotkey before ending the recording.
 """
 import main
 
@@ -30,7 +30,7 @@ def test_on_key_up_ignores_non_owning_hotkey(monkeypatch):
     assert main.current_mode == main.MODE_DICTATE
 
 
-def test_on_key_up_for_owning_hotkey_claims_transition(monkeypatch):
+def test_on_key_up_for_owning_hotkey_ends_the_recording(monkeypatch):
     """Positive control: the owning hotkey's key-up DOES leave 'recording'."""
     _reset_state(monkeypatch)
     monkeypatch.setattr(main, "state", "recording")
@@ -53,8 +53,9 @@ def test_on_key_up_for_owning_hotkey_claims_transition(monkeypatch):
 
     main.on_key_up(main.TRANSLATE_KEYCODE)
 
-    # begin_processing flipped recording→processing, then short audio reset to idle
+    # begin_processing freed the slot and queued a job; the short audio then dropped it
     assert main.state == "idle"
+    assert main._jobs == {}
     # current_hotkey was cleared by begin_processing
     assert main.current_hotkey is None
     assert main.current_mode is None

@@ -104,19 +104,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 PENDING_DIR = PROJECT_ROOT / ".pending"
 QUARANTINE_DIR = PENDING_DIR / "quarantine"
 
-# Watchdog: an independent poll thread resets stuck states. Triggers when a
-# key-up is lost (Secure Input app, tap glitch, mid-recording crash) and the
-# state machine would otherwise sit forever with audio buffering in memory.
-# The hard limit stops a hands-free recording someone forgot about. Reaching
+# Watchdog: an independent poll thread ends a recording that has run past
+# RECORDING_TIMEOUT_SEC (a key-up lost to a Secure Input app, a tap glitch, a
+# forgotten hands-free take) and drops a take stuck in transcription from the
+# queue, so the takes behind it can paste. Reaching
 # it finalizes and transcribes the audio instead of discarding it. 20 minutes
 # is about 38 MB at 16 kHz, well inside transcriber.MAX_UPLOAD_BYTES. Do not poll
 # CGEventSourceKeyState for modifier ownership here: macOS can report a held
 # right-side modifier as released, which would cut off valid dictation.
 RECORDING_TIMEOUT_SEC = 20 * 60
-# Translation makes two provider calls (STT, translate), each with bounded
-# retries. Keep the watchdog above that legitimate retry budget so it never
-# invalidates a worker still making progress.
-PROCESSING_TIMEOUT_SEC = 360
+# How long a take may transcribe before the watchdog drops it. A take makes up
+# to two provider calls (STT, translate), each with bounded retries, and the
+# STT timeout grows with the audio (transcriber.TRANSCRIPTION_TIMEOUT_SEC_PER_
+# AUDIO_MIN, per attempt, on two models). The limit grows with it, so the
+# watchdog never voids a take whose worker is still making progress.
+TAKE_TIMEOUT_SEC = 360
+TAKE_TIMEOUT_SEC_PER_AUDIO_MIN = 20
 WATCHDOG_POLL_SEC = 5
 # How long a shutdown waits for an in-flight recording to reach disk. Only a
 # wedged save should ever come close to it.
@@ -161,6 +164,7 @@ _instance_lock_file = None
 MICROPHONE_AUTH_NOT_DETERMINED = 0
 MICROPHONE_AUTH_RESTRICTED = 1
 MICROPHONE_AUTH_DENIED = 2
+MICROPHONE_BLOCKED = frozenset({MICROPHONE_AUTH_RESTRICTED, MICROPHONE_AUTH_DENIED})
 MICROPHONE_AUTH_AUTHORIZED = 3
 MICROPHONE_MEDIA_TYPE = "soun"
 
@@ -241,10 +245,7 @@ def microphone_authorization_status():
 
 def _microphone_access_is_blocked():
     status = microphone_authorization_status()
-    return status in {
-        MICROPHONE_AUTH_RESTRICTED,
-        MICROPHONE_AUTH_DENIED,
-    }
+    return status in MICROPHONE_BLOCKED
 
 
 def handle_shutdown(signum, _frame):
@@ -295,9 +296,10 @@ overlay = Overlay()
 state = "idle"
 state_ts = time.monotonic()
 state_lock = threading.Lock()
-# Serializes clipboard mutations between live-worker pastes and the
+# Serializes clipboard mutations between the drain's pastes and the
 # background pending-recovery pass, so recovered text can never race a fresh
-# dictation paste into the same clipboard. Also what keeps pastes in order.
+# dictation paste into the same clipboard. Recovery also holds it around its
+# glob (see recover_pending_recordings). Also what keeps pastes in order.
 _clipboard_gate = threading.Lock()
 # Held by on_key_up from the moment the samples leave the recorder until the WAV
 # is on disk. handle_shutdown waits on it, closing the window where a signal
@@ -329,9 +331,10 @@ class Job:
 # Guarded by state_lock. A worker whose job is no longer here was voided by a
 # cancel, the watchdog or shutdown: it drops its result, the audio stays queued.
 _jobs = {}
-# Which hotkey owns the in-flight cycle. Set in on_key_down, consumed in on_key_up.
-# A key-up event whose keycode doesn't match current_hotkey is ignored, so tapping
-# the OTHER hotkey mid-record can't end the cycle. Watchdog also clears it on reset.
+# Which hotkey owns the recording. Set by _begin_recording, cleared when the
+# slot frees (begin_processing, _abandon_recording_cycle, shutdown). A key-up
+# whose keycode doesn't match is ignored, so tapping the OTHER hotkey
+# mid-record can't end the cycle.
 current_hotkey = None
 current_mode = None
 # Whether the recording cycle is hands-free. Written by
@@ -406,6 +409,16 @@ def _install_shutdown_handling():
     ).start()
 
 
+def _take_timeout(job):
+    """TAKE_TIMEOUT_SEC, plus TAKE_TIMEOUT_SEC_PER_AUDIO_MIN per minute of audio."""
+    try:
+        # 16 kHz mono 16-bit: 32,000 bytes per second.
+        minutes = job.path.stat().st_size / 32000 / 60 if job.path else 0.0
+    except OSError:
+        minutes = 0.0
+    return TAKE_TIMEOUT_SEC + minutes * TAKE_TIMEOUT_SEC_PER_AUDIO_MIN
+
+
 def _watchdog_tick():
     """
     Single watchdog pass. The hard recording limit is routed through the normal
@@ -422,7 +435,7 @@ def _watchdog_tick():
             finish_keycode = current_hotkey
         stuck = [
             job for job in _jobs.values()
-            if not job.done and now - job.started > PROCESSING_TIMEOUT_SEC
+            if not job.done and now - job.started > _take_timeout(job)
         ]
         for job in stuck:
             del _jobs[job.id]
@@ -466,7 +479,7 @@ def pending_retry_loop():
     unprompted paste.
 
     The clipboard gate is taken inside recover_pending_recordings, around the
-    clipboard write alone. Holding it across the transcription calls would
+    glob and the clipboard write, never across the transcription calls. Holding it across the transcription calls would
     block a live dictation's paste for as long as the provider takes on every
     queued file — long enough for the watchdog to void that dictation.
     """
@@ -814,6 +827,13 @@ def error_notice(error, retry_in=None):
     return _with_retry(text, retry_in)
 
 
+def _transcribe(path, mode):
+    """The take's text: dictated as spoken, or translated to English."""
+    if mode == MODE_TRANSLATE:
+        return transcriber.transcribe_and_translate_sync(path)
+    return transcriber.transcribe_dictation_sync(path, language=DICTATE_LANGUAGE)
+
+
 def process_pending_recording(path, job_id, mode):
     """
     Live worker spawned by on_key_up, one per take; several run at once. It
@@ -826,10 +846,7 @@ def process_pending_recording(path, job_id, mode):
     notice = None
     rejected = False
     try:
-        if mode == MODE_TRANSLATE:
-            text = transcriber.transcribe_and_translate_sync(path)
-        else:
-            text = transcriber.transcribe_dictation_sync(path, language=DICTATE_LANGUAGE)
+        text = _transcribe(path, mode)
     except RequestRejectedError as e:
         # Unacceptable to the provider as-is, so a retry is guaranteed to fail
         # the same way. Keeping it pending would burn a quota slot every
@@ -870,6 +887,9 @@ _HELD_MODIFIERS = (
     kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate
     | kCGEventFlagMaskShift | kCGEventFlagMaskControl
 )
+# Takes that are ready together go in as one paste, a blank line apart, so
+# each stays its own paragraph instead of running into the next.
+TAKE_SEPARATOR = "\n\n"
 # One recheck timer at a time, however many drains see the key held.
 _drain_recheck_armed = False
 # When a drain first found a done take held back by a modifier with nothing
@@ -959,9 +979,14 @@ def _drain_ready_jobs():
                     _drain_recheck_armed = False
                 log(f"drain recheck start error: {e}")
 
-        texts = [job for job in ready if job.text and not job.notice]
+        texts = [job for job in ready if job.text and job.text.strip() and not job.notice]
         if texts:
-            combined = "".join(job.text for job in texts)
+            # Every take ends in a space for whatever is typed next; inside the
+            # paste that space would sit at the end of a line, so only the
+            # last take keeps it.
+            combined = TAKE_SEPARATOR.join(
+                [job.text.rstrip() for job in texts[:-1]] + [texts[-1].text]
+            )
             if not overdue and paste_text(combined):
                 log(f"pasted {len(combined)} chars from {len(texts)} take(s)")
                 delivered = True
@@ -986,7 +1011,7 @@ def _drain_ready_jobs():
                 if job.rejected:
                     quarantine_path(job.path, "rejected by the provider")
                 # otherwise the file stays for the retry loop
-            elif not job.text:
+            elif not (job.text and job.text.strip()):
                 log(f"no speech detected in {job.path.name}")
                 delete_pending_recording(job.path)
 
@@ -1032,13 +1057,12 @@ _recovered_text = {}
 
 def recover_pending_recordings():
     """
-    Startup recovery. Transcribes every pending WAV, joins them with a separator,
-    and writes the combined text to the clipboard once at the end. Per-file
-    overwrite would lose all but the last transcript. Never auto-pastes — focus
-    at login is unrelated to the dictation context.
-
-    Runs synchronously BEFORE the event tap activates so a fresh dictation
-    can never race the recovery clipboard write.
+    Transcribe every due pending WAV, join the texts with RECOVERY_SEPARATOR
+    and write them to the clipboard once: a write per file would leave only
+    the last. Never auto-pastes — the focus now is unrelated to where the
+    words were spoken. Runs at startup, before the event tap activates, and
+    from pending_retry_loop. If a take goes live meanwhile, the texts wait in
+    _recovered_text for the next pass instead of being overwritten by its paste.
     """
     pending_dirs = []
     for pending_dir in (PENDING_DIR, FALLBACK_PENDING_DIR):
@@ -1066,7 +1090,7 @@ def recover_pending_recordings():
     # first, then drop whatever a job owns. The drain holds _clipboard_gate
     # from taking a job out of _jobs until its file is gone, so under the gate
     # a file is never between owners; and a take still being saved has no
-    # path yet, so its file could be in the glob unclaimed: wait for it.
+    # path yet, so its file could be in the glob with no owner: wait for it.
     with _clipboard_gate:
         found = [
             path
@@ -1113,10 +1137,7 @@ def recover_pending_recordings():
             recovered.append((path, _recovered_text[path.name]))
             continue
         try:
-            if mode == MODE_TRANSLATE:
-                text = transcriber.transcribe_and_translate_sync(path)
-            else:
-                text = transcriber.transcribe_dictation_sync(path, language=DICTATE_LANGUAGE)
+            text = _transcribe(path, mode)
         except ProviderUnavailableError as e:
             # The network is out, not this file's fault, so it must NOT count
             # toward quarantine. Put the rest of the queue on the backoff and
@@ -1210,7 +1231,7 @@ def _all_pending_names(min_age_sec=0.0):
     Every recording currently queued on disk, across both directories.
 
     min_age_sec keeps a cancel from touching one that has only just been
-    written: the same grace the in-flight job gets, so the rule the user sees
+    written: the same grace queued takes get, so the rule the user sees
     is one rule — a tap acts on what has been stuck for a while, never on
     something that is still perfectly on track.
     """
@@ -1233,11 +1254,9 @@ def cancel_everything(min_age=0.0):
     """
     Stop whatever is in flight and hold the queue, without losing audio.
 
-    Voids every queued job at least min_age old, so a late worker drops its
-    result instead of pasting into whatever the user is doing next. Younger
-    takes carry on and paste: the cancel tap passes CANCEL_GRACE_SEC, and a
-    take voided before its file is old enough to be held would be picked up
-    by the retry loop while its worker still runs. A recording still being
+    Voids every unfinished queued take at least min_age old, so a late worker
+    drops its result instead of pasting into whatever the user is doing next.
+    Finished takes and younger ones carry on and paste. A recording still being
     captured is finalized to disk rather than dropped — the user asked to stop
     waiting, not to discard what they said.
 
@@ -1262,7 +1281,7 @@ def cancel_everything(min_age=0.0):
         for job in stale:
             del _jobs[job.id]
         if stale and stopped is None:
-            stopped = "processing"
+            stopped = "transcription"
         # Held by name: a file written a moment after its job started can be
         # younger than the grace while the job is past it, and an unheld file
         # would go straight back to the retry loop.
@@ -1297,9 +1316,10 @@ def resume_everything():
     """
     with _pending_failures_lock:
         _pending_cancelled.clear()
-        for name in _all_pending_names():
+        names = _all_pending_names()
+        for name in names:
             _pending_next_attempt[name] = 0.0
-        return len(_all_pending_names())
+        return len(names)
 
 
 def _begin_recording(keycode, mode, hands_free=False):
@@ -1713,10 +1733,7 @@ def main():
         f"translation backend: {translator}"
     )
     microphone_status = microphone_authorization_status()
-    if microphone_status in {
-        MICROPHONE_AUTH_RESTRICTED,
-        MICROPHONE_AUTH_DENIED,
-    }:
+    if microphone_status in MICROPHONE_BLOCKED:
         log(
             "ERROR: Microphone permission is denied or restricted; enable it "
             "in System Settings > Privacy & Security > Microphone"

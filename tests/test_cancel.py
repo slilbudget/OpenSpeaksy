@@ -126,7 +126,7 @@ def test_a_second_tap_puts_it_back_in_the_queue(app, monkeypatch, tmp_path):
 def test_cancelling_a_live_job_makes_its_worker_abort(app, monkeypatch, tmp_path):
     """
     A worker that finishes after the cancel must not paste into whatever the
-    user is doing by then — the same rule the watchdog reset relies on.
+    user is doing by then: a cancel voids the job and the worker drops its result.
     """
     wav = _wav(tmp_path / "20260922-030003-a.dictate.wav")
     _queue(7, wav)
@@ -137,10 +137,10 @@ def test_cancelling_a_live_job_makes_its_worker_abort(app, monkeypatch, tmp_path
     monkeypatch.setattr(main, "paste_text", lambda t: pasted.append(t) or True)
 
     stopped, _, _ = main.cancel_everything()
-    # The worker was already running with the old generation.
+    # The worker was already running when its job was voided.
     main.process_pending_recording(wav, 7, main.MODE_DICTATE)
 
-    assert stopped == "processing"
+    assert stopped == "transcription"
     assert pasted == []
     assert wav.exists()
 

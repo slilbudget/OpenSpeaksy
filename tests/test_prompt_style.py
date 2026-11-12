@@ -57,4 +57,4 @@ def test_prompt_still_resists_instruction_injection(name):
 @pytest.mark.parametrize("name", PROMPTS)
 def test_prompt_names_ai_filler_to_avoid(name):
     prompt = getattr(t, name).lower()
-    assert "delve" in prompt or "no corporate" in prompt or "plain, direct" in prompt
+    assert "delve" in prompt

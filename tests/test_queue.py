@@ -81,8 +81,9 @@ def test_a_take_that_finishes_early_waits_for_the_one_before_it(q):
     assert second.exists()
 
     q.finish(1, "first ")
-    # One paste, in spoken order: two ⌘V back to back can race the clipboard.
-    assert q.pasted == ["first second "]
+    # One paste, in spoken order, a blank line apart: two ⌘V back to back
+    # can race the clipboard.
+    assert q.pasted == ["first\n\nsecond "]
     assert not first.exists() and not second.exists()
     assert main._jobs == {}
 
@@ -203,7 +204,7 @@ def test_the_watchdog_drops_a_stuck_take_and_the_next_one_pastes(q, monkeypatch)
     monkeypatch.setattr(main, "_schedule_drain", main._drain_ready_jobs)
     stuck = q.queue(1)
     q.queue(2)
-    main._jobs[1].started -= main.PROCESSING_TIMEOUT_SEC + 1
+    main._jobs[1].started -= main._take_timeout(main._jobs[1]) + 1
     main._jobs[2].done = True
     main._jobs[2].text = "next "
 
@@ -323,7 +324,8 @@ def test_three_takes_end_to_end_paste_in_spoken_order(monkeypatch, tmp_path):
         time.sleep(0.02)
 
     assert main._jobs == {}
-    assert "".join(pasted) == "take1 take2 take3 "
+    # How they batch depends on timing; the order and the words never do.
+    assert "".join(pasted).split() == ["take1", "take2", "take3"]
     assert list(tmp_path.glob("*.wav")) == []
     assert overlay.events[-1] == ("hide",)
     # Let the drain threads the last paste spawned wind down.
@@ -460,10 +462,12 @@ def test_recovery_leaves_a_take_that_is_still_being_saved(q, monkeypatch, tmp_pa
         main.transcriber, "transcribe_dictation_sync",
         lambda *a, **k: pytest.fail("transcribed a live take"),
     )
-    _wav(tmp_path / "20261112-000001-a.dictate.wav")
+    wav = _wav(tmp_path / "20261112-000001-a.dictate.wav")
     main._jobs[1] = main.Job(1, main.MODE_DICTATE)      # path not set yet
 
     main.recover_pending_recordings()
+
+    assert wav.exists()
 
 
 def test_the_recorder_stops_before_the_slot_frees(q, monkeypatch, tmp_path):
@@ -614,3 +618,37 @@ def test_a_voided_take_is_held_even_if_its_file_is_young(q):
     main.cancel_everything(min_age=main.CANCEL_GRACE_SEC)
 
     assert wav.name in main._pending_cancelled
+
+
+def test_three_takes_ready_together_are_three_paragraphs(q):
+    q.queue(1), q.queue(2), q.queue(3)
+    q.finish(3, "third ")
+    q.finish(2, "second.\n")
+    q.finish(1, "first ")
+    assert q.pasted == ["first\n\nsecond.\n\nthird "]
+
+
+def test_a_take_that_is_only_whitespace_adds_no_gap(q):
+    blank = [q.queue(1), q.queue(2), q.queue(3)][1]
+    q.finish(2, "  ")
+    q.finish(3, "c ")
+    q.finish(1, "a ")
+    assert q.pasted == ["a\n\nc "]
+    assert not blank.exists()
+
+
+def test_a_long_take_gets_longer_before_the_watchdog_drops_it(q, tmp_path):
+    """
+    A 20-minute take's STT timeout alone is 130 s per attempt, on two models.
+    A flat limit would void it while its worker is still on track.
+    """
+    short = q.queue(1)
+    long_wav = tmp_path / "long.dictate.wav"
+    with open(long_wav, "wb") as f:
+        f.truncate(20 * 60 * 32000)
+    main._jobs[2] = main.Job(2, main.MODE_DICTATE)
+    main._jobs[2].path = long_wav
+
+    assert main._take_timeout(main._jobs[1]) < main.TAKE_TIMEOUT_SEC + 1
+    assert main._take_timeout(main._jobs[2]) >= main.TAKE_TIMEOUT_SEC + 20 * main.TAKE_TIMEOUT_SEC_PER_AUDIO_MIN
+    assert short.exists()

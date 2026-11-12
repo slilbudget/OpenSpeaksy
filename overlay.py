@@ -63,7 +63,7 @@ _EASE = None
 
 # One component, one look. All modes are the SAME dark pill; translate and
 # hands-free only add a thin text label above it. The fill is a
-# flat, semi-transparent dark color (static — no blur, no adaptation), so the
+# flat, opaque dark color (static — no blur, no adaptation), so the
 # light content always reads on it. Error keeps the dark fill and a coral glyph.
 FILL_RGBA = (36 / 255, 36 / 255, 36 / 255, 1.0)    # Dark pill fill — #242424 neutral gray-black
 EDGE_RGBA = (1.0, 1.0, 1.0, 0.14)      # Soft light hairline rim
@@ -93,8 +93,9 @@ ERROR_TEXT_RGBA = (1.0, 1.0, 1.0, 0.92)
 # exactly like "error" — same dark pill, same type — because the difference
 # that matters to the user is the words, not a color they would have to learn.
 _MESSAGE_MODES = ("error", "notice")
-# A recovered transcript replaces the clipboard, which is easy to miss while
-# working in another window. The sound is what makes it noticeable.
+# A notice means the clipboard changed without a paste (recovery, or a ⌘V
+# that could not be posted), which is easy to miss while working in another
+# window. The sound is what makes it noticeable.
 NOTICE_SOUND = "Glass"
 
 FILL = None
@@ -298,34 +299,25 @@ class OverlayView(NSView):
             self._message = message
             self._glyph.setNeedsDisplay_(True)
 
-    def expandToMessage_(self, message):
-        """Grow the pill to fit an error message instead of the glyph size."""
-        NSAnimationContext.beginGrouping()
-        ctx = NSAnimationContext.currentContext()
-        ctx.setDuration_(EXPAND_IN)
-        ctx.setTimingFunction_(_EASE)
-        ctx.setAllowsImplicitAnimation_(True)
-        self._surface.animator().setFrame_(_error_frame(message))
-        NSAnimationContext.endGrouping()
-
-    def expand(self):
+    def _animate_surface(self, frame, duration):
         # Calm ease, no overshoot — the pill settles statically.
         NSAnimationContext.beginGrouping()
         ctx = NSAnimationContext.currentContext()
-        ctx.setDuration_(EXPAND_IN)
+        ctx.setDuration_(duration)
         ctx.setTimingFunction_(_EASE)
         ctx.setAllowsImplicitAnimation_(True)
-        self._surface.animator().setFrame_(_full_frame())
+        self._surface.animator().setFrame_(frame)
         NSAnimationContext.endGrouping()
 
+    def expandToMessage_(self, message):
+        """Grow the pill to fit an error message instead of the glyph size."""
+        self._animate_surface(_error_frame(message), EXPAND_IN)
+
+    def expand(self):
+        self._animate_surface(_full_frame(), EXPAND_IN)
+
     def collapse(self):
-        NSAnimationContext.beginGrouping()
-        ctx = NSAnimationContext.currentContext()
-        ctx.setDuration_(EXPAND_OUT)
-        ctx.setTimingFunction_(_EASE)
-        ctx.setAllowsImplicitAnimation_(True)
-        self._surface.animator().setFrame_(_circle_frame())
-        NSAnimationContext.endGrouping()
+        self._animate_surface(_circle_frame(), EXPAND_OUT)
 
     def tick_(self, timer):
         if self._mode == "recording":
@@ -447,24 +439,22 @@ class Overlay:
     def hide(self):
         AppHelper.callAfter(self._set_base, None)
 
-    def flash_error(self, message=None, duration=None):
+    def flash_error(self, message=None):
         """
         Show the error pill. With a message the pill widens to fit it and stays
         up long enough to read; without one it is the compact "!" flash.
         """
         message = _clean_message(message)
-        if duration is None:
-            duration = _read_time(message) if message else ERROR_FLASH_SEC
+        duration = _read_time(message) if message else ERROR_FLASH_SEC
         AppHelper.callAfter(self._flash, "error", message, duration, False)
 
-    def flash_notice(self, message, duration=None, sound=True):
+    def flash_notice(self, message, sound=True):
         """
-        A neutral message pill — e.g. a recovered transcript landing in the
-        clipboard, which the user needs to know about even mid-dictation.
+        A neutral message pill — e.g. text landing in the clipboard instead of
+        being pasted, which the user needs to know about even mid-dictation.
         """
         message = _clean_message(message)
-        if duration is None:
-            duration = _read_time(message)
+        duration = _read_time(message)
         AppHelper.callAfter(self._flash, "notice", message, duration, sound)
 
     def _set_base(self, base):

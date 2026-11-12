@@ -1,7 +1,7 @@
 """
 The live worker and the pending-recovery pass: what happens to the audio and to
 the clipboard when transcription fails, and what each is allowed to touch while
-the other is running. Both were entirely untested.
+the other is running.
 """
 import struct
 import threading
@@ -308,7 +308,7 @@ def test_a_recovery_clipboard_failure_keeps_every_recording(
 def test_the_gate_still_serializes_the_two_clipboard_writers(recovery, monkeypatch, tmp_path):
     """
     Narrowing the gate must not remove it: recovery's write still cannot land
-    between a live worker's claim and its paste.
+    between the drain taking a take out of _jobs and its paste.
     """
     _wav(tmp_path / "20260827-000015-a.dictate.wav")
     monkeypatch.setattr(
@@ -340,18 +340,18 @@ def test_a_corrupt_wav_is_quarantined_not_transcribed(recovery, monkeypatch, tmp
     assert (tmp_path / "quarantine" / junk.name).exists()
 
 
-def test_watchdog_processing_timeout_preserves_the_recording(monkeypatch, tmp_path):
+def test_watchdog_timeout_drops_the_take_and_keeps_the_recording(monkeypatch, tmp_path):
     """
-    The processing timeout resets state and reports it. The WAV must stay on
-    disk: the retry loop is what eventually turns it into text.
+    The watchdog drops a take stuck in transcription and reports it. The WAV
+    must stay on disk: the retry loop is what eventually turns it into text.
     """
     overlay = _Overlay()
     wav = _wav(tmp_path / "20260827-000017-a.dictate.wav")
     monkeypatch.setattr(main, "overlay", overlay)
     monkeypatch.setattr(main, "state", "idle")
     monkeypatch.setattr(main, "_schedule_drain", lambda: None)
-    _queue(4, wav).parent
-    main._jobs[4].started = main.time.monotonic() - main.PROCESSING_TIMEOUT_SEC * 2
+    _queue(4, wav)
+    main._jobs[4].started = main.time.monotonic() - main._take_timeout(main._jobs[4]) * 2
 
     main._watchdog_tick()
 

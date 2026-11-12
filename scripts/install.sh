@@ -83,15 +83,19 @@ deactivate
 
 step "Generating LaunchAgent plist"
 mkdir -p "$LAUNCH_AGENTS"
+# launchd opens the stdout/stderr log before the app's umask applies, so the
+# folder itself has to keep it private: a traceback can carry error text.
+mkdir -p "$HOME/Library/Logs/${LABEL_APP}"
+chmod 700 "$HOME/Library/Logs/${LABEL_APP}"
 
 # Use Python's plistlib so paths and key values with XML-sensitive characters
 # are escaped correctly — sed-substitution would corrupt the plist.
 MISTRAL_API_KEY="$MISTRAL_API_KEY" \
 "$PYTHON_RUNTIME" - "$PROJECT_ROOT/launchd/${LABEL_APP}.plist.template" \
                     "$LAUNCH_AGENTS/${LABEL_APP}.plist" \
-                    "$PROJECT_ROOT" <<'PYEOF'
+                    "$PROJECT_ROOT" "$HOME" <<'PYEOF'
 import os, sys, plistlib
-template, target, project_root = sys.argv[1:4]
+template, target, project_root, home = sys.argv[1:5]
 mistral_key = os.environ.pop("MISTRAL_API_KEY")
 with open(template, "rb") as f:
     pl = plistlib.load(f)
@@ -103,17 +107,24 @@ def replace(node):
         return {k: replace(v) for k, v in node.items()}
     if isinstance(node, str):
         return (node.replace("__PROJECT_ROOT__", project_root)
+                    .replace("__HOME__", home)
                     .replace("__MISTRAL_API_KEY__", mistral_key))
     return node
 
 # Open with 0600 from the start so the API key is never world-readable,
 # even briefly. os.open + plistlib.dump on the resulting fd avoids the
 # default-umask window an open(target, "wb") + os.chmod sequence leaves.
-fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+# Written to a temp file and renamed into place, so a crash never leaves a
+# cut-off plist, and fchmod'ed before the key goes in: os.open's mode only
+# applies on creation, and a leftover temp file could be looser.
+tmp = target + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.fchmod(fd, 0o600)
 with os.fdopen(fd, "wb") as f:
     plistlib.dump(replace(pl), f)
-# os.open honors mode only on file creation; chmod fixes a pre-existing target.
-os.chmod(target, 0o600)
+    f.flush()
+    os.fsync(f.fileno())
+os.replace(tmp, target)
 PYEOF
 
 step "Loading LaunchAgent"
@@ -139,11 +150,12 @@ Using it
   Hold right Shift                     speak Russian, paste English
   Caps Lock                            cancel a stuck transcription
 
-  Words it mishears: cp vocabulary.example.txt vocabulary.txt and list them
+  Words it mishears: cp "$PROJECT_ROOT/vocabulary.example.txt" "$PROJECT_ROOT/vocabulary.txt"
+                     and list them there
 
   Logs:    tail -f ~/Library/Logs/com.openspeaksy/main.log
   Stop:    launchctl unload ~/Library/LaunchAgents/com.openspeaksy.plist
-  Remove:  ./scripts/uninstall.sh
+  Remove:  "$PROJECT_ROOT/scripts/uninstall.sh"
 
 To rotate an API key later, edit
 $LAUNCH_AGENTS/${LABEL_APP}.plist

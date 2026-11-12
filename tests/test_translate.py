@@ -270,8 +270,8 @@ def test_translate_sets_russian_while_dictate_keeps_auto_detection(transcriber_m
 
 def test_translate_makes_exactly_one_llm_call(transcriber_module, tmp_path):
     """
-    The polishing pass was removed: a long translation must still cost one
-    STT call plus one translate call, never a third round-trip.
+    A long translation must still cost one STT call plus one translate
+    call, never a third round-trip.
     """
     t = transcriber_module
     wav = _write_silent_wav(tmp_path)

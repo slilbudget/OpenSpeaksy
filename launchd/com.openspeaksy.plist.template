@@ -37,8 +37,8 @@
     <key>ThrottleInterval</key>
     <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>/tmp/openspeaksy.log</string>
+    <string>__HOME__/Library/Logs/com.openspeaksy/stdout.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/openspeaksy.log</string>
+    <string>__HOME__/Library/Logs/com.openspeaksy/stdout.log</string>
 </dict>
 </plist>

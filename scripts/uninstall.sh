@@ -17,7 +17,7 @@ echo "==> Removing LaunchAgent plist"
 rm -f "$LAUNCH_AGENTS/${LABEL_APP}.plist"
 
 echo "==> Cleaning logs"
-rm -f /tmp/openspeaksy.log
+rm -f /tmp/openspeaksy.log   # where installs before 2026-11 sent stdout
 rm -rf "$HOME/Library/Logs/com.openspeaksy"
 
 cat <<EOF

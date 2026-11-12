@@ -20,13 +20,13 @@ class _Overlay:
     def __init__(self):
         self.events = []
 
-    def hide(self, token=None):
-        self.events.append(("hide", token))
+    def hide(self, **_):
+        self.events.append(("hide", None))
 
-    def show(self, mode, label=None, token=None):
+    def show(self, mode, label=None, queued=0, **_):
         self.events.append((mode, label))
 
-    def flash_error(self, message=None, duration=None, token=None):
+    def flash_error(self, message=None, duration=None, **_):
         self.events.append(("error", message))
 
     def flash_notice(self, message, duration=None, sound=True):
@@ -55,7 +55,6 @@ def recovery(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "FALLBACK_PENDING_DIR", tmp_path / "fallback")
     monkeypatch.setattr(main, "QUARANTINE_DIR", tmp_path / "quarantine")
     monkeypatch.setattr(main, "state", "idle")
-    monkeypatch.setattr(main, "current_wav_path", None)
     monkeypatch.setattr(main, "copy_to_clipboard", lambda text: None)
     return overlay
 
@@ -156,7 +155,7 @@ def test_a_recovered_transcript_announces_itself(recovery, monkeypatch, tmp_path
 
     notices = [m for kind, m in recovery.events if kind == "notice"]
     assert len(notices) == 1
-    assert "clipboard" in notices[0]
+    assert notices[0] == "Copied · ⌘V"
 
 
 def test_a_failed_notice_still_lets_the_audio_be_released(

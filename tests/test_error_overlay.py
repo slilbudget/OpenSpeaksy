@@ -24,22 +24,22 @@ def test_a_wait_hint_becomes_the_headline():
             "Mistral is rate-limited; next one frees up in 39s"
         )
     )
-    assert notice == "Rate limited, try again in 39s"
+    assert notice == "Rate limited · 39s"
 
 
 def test_a_retry_in_hint_is_also_read():
     notice = main.error_notice(TranscriptionError("Please retry in 12.4s"))
-    assert notice == "Rate limited, try again in 12s"
+    assert notice == "Rate limited · 12s"
 
 
 def test_throttling_without_a_hint_still_reads_as_throttling():
     assert main.error_notice(
         TranscriptionError("HTTP Error 429: Too Many Requests")
-    ) == "Rate limited, try again shortly"
+    ) == "Rate limited"
 
 
 def test_a_dead_network_says_so():
-    assert "connection" in main.error_notice(
+    assert "No connection" == main.error_notice(
         ProviderUnavailableError("[Errno 8] nodename nor servname provided")
     )
 
@@ -47,9 +47,9 @@ def test_a_dead_network_says_so():
 @pytest.mark.parametrize(
     "raw, expected_fragment",
     [
-        ("recording is too large for Mistral upload: 99 bytes", "too long"),
+        ("recording is too large for Mistral upload: 99 bytes", "Too long"),
         ("Mistral API key is not configured", "API key"),
-        ("Microphone permission is denied", "Microphone"),
+        ("Microphone permission is denied", "Mic blocked"),
     ],
 )
 def test_known_failures_get_plain_language(raw, expected_fragment):
@@ -64,7 +64,7 @@ def test_an_unrecognized_error_is_shown_verbatim_not_swallowed():
 
 
 def test_an_empty_error_still_says_something():
-    assert main.error_notice(TranscriptionError("")) == "Transcription failed"
+    assert main.error_notice(TranscriptionError("")) == "Failed"
 
 
 # --- shaping the message ----------------------------------------------------
@@ -129,48 +129,120 @@ def test_read_time_is_bounded():
     assert o._read_time("x" * o.ERROR_MAX_CHARS) <= o.ERROR_MESSAGE_MAX_SEC
 
 
-# --- who owns the pill ------------------------------------------------------
+# --- what the pill returns to -----------------------------------------------
 
-class _Panel:
-    """Enough of an NSPanel to see whether _show was reached."""
+def _overlay(monkeypatch):
+    """An Overlay whose drawing is recorded instead of done, with AppKit's
+    main-thread hop run inline and the flash timer captured."""
+    ov = o.Overlay()
+    drawn = []
+    timers = []
+    monkeypatch.setattr(o.AppHelper, "callAfter", lambda fn, *a: fn(*a))
+    monkeypatch.setattr(ov, "_show", lambda mode, label, message=None, queued=0: (
+        setattr(ov, "_gen", ov._gen + 1), drawn.append((mode, label, message, queued))))
+    monkeypatch.setattr(ov, "_hide", lambda: drawn.append("hidden"))
 
-    def __init__(self):
-        self.shown = 0
+    class _Timer:
+        def __init__(self, delay, fn):
+            self.fn = fn
+            timers.append(self)
+            self.daemon = True
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(o.threading, "Timer", _Timer)
+    return ov, drawn, timers
 
 
-def test_a_late_workers_error_does_not_hijack_the_next_recording(monkeypatch):
+def test_an_error_during_a_recording_returns_to_the_recording(monkeypatch):
     """
-    The worker claims its job and the state machine goes idle BEFORE the paste,
-    so the user can start the next recording while the old worker is finishing.
-    An untokened error from that worker covered the new recording's pill and
-    then took it down mid-sentence. The failure is still in the log, and the
-    audio still waits in .pending for the retry loop.
+    With a queue, an earlier take can fail while the next one is recording.
+    The error is shown, and then the recording pill comes back: the flash used
+    to take the pill down, mid-sentence.
     """
-    ov = o.Overlay()
-    reached = []
-    monkeypatch.setattr(ov, "_show", lambda *a, **k: reached.append(a))
-    ov._token = 12  # a newer cycle owns the pill
-
-    ov._flash_error("Rate limited, try again in 52s", 3.0, token=9)
-    assert reached == []
-
-
-def test_the_owning_workers_error_is_shown(monkeypatch):
-    ov = o.Overlay()
-    reached = []
-    monkeypatch.setattr(ov, "_show", lambda *a, **k: reached.append(a))
-    ov._token = 9
-
-    ov._flash_error("Rate limited, try again in 52s", 3.0, token=9)
-    assert len(reached) == 1
+    ov, drawn, timers = _overlay(monkeypatch)
+    ov.show("recording", label=None, queued=1)
+    ov.flash_error("No connection · retry in 10s")
+    timers[-1].fn()
+    assert drawn[-2][0] == "error"
+    assert drawn[-1] == ("recording", None, None, 1)
 
 
-def test_an_untokened_error_always_shows(monkeypatch):
-    """Errors raised before a job exists (microphone, recorder) have no token."""
-    ov = o.Overlay()
-    reached = []
-    monkeypatch.setattr(ov, "_show", lambda *a, **k: reached.append(a))
-    ov._token = 12
+def test_state_changes_during_a_flash_wait_for_it(monkeypatch):
+    ov, drawn, timers = _overlay(monkeypatch)
+    ov.flash_notice("Copied · ⌘V", sound=False)
+    ov.show("loading", queued=2)
+    assert drawn[-1][0] == "notice"     # the notice stays readable
+    timers[-1].fn()
+    assert drawn[-1] == ("loading", None, None, 2)
 
-    ov._flash_error("Could not start recording", 1.2, token=None)
-    assert len(reached) == 1
+
+def test_only_the_latest_flash_ends_the_flashing(monkeypatch):
+    ov, drawn, timers = _overlay(monkeypatch)
+    ov.flash_error("First")
+    ov.flash_error("Second")
+    timers[0].fn()                      # the first one's timer fires late
+    assert drawn[-1][2] == "Second"
+    timers[1].fn()
+    assert drawn[-1] == "hidden"
+
+
+def test_queue_dots():
+    assert o._queue_dots("recording", 0) == 0
+    assert o._queue_dots("recording", 1) == 1    # one take behind the recording
+    assert o._queue_dots("recording", 40) == o.DOT_MAX
+    assert o._queue_dots("loading", 1) == 0      # the spinner is that one
+    assert o._queue_dots("loading", 2) == 1      # one waits behind it
+    assert o._queue_dots("loading", 3) == 2
+    assert o._queue_dots("loading", 40) == o.DOT_MAX
+    assert o._queue_dots("error", 3) == 0
+
+
+def test_a_flash_does_not_freeze_the_pill(monkeypatch):
+    ov, drawn, timers = _overlay(monkeypatch)
+    ov.show("recording")
+    ov.flash_error("x")
+    timers[-1].fn()
+    ov.show("loading", queued=2)
+    assert drawn[-1] == ("loading", None, None, 2)
+    ov.hide()
+    assert drawn[-1] == "hidden"
+
+
+def test_a_new_recording_cuts_a_long_message_short(monkeypatch):
+    """Under a 6 s error the user could not see that the next take records."""
+    ov, drawn, timers = _overlay(monkeypatch)
+    ov.show("loading", queued=1)
+    ov.flash_error("No connection · retry in 10s")
+    ov.show("recording", queued=1)
+    assert drawn[-1][0] == "error"          # still readable for a moment
+    assert len(timers) == 2                 # but now ends early
+    timers[-1].fn()
+    assert drawn[-1] == ("recording", None, None, 1)
+    # The flash's own, later timer is a no-op by then.
+    timers[0].fn()
+    assert drawn[-1] == ("recording", None, None, 1)
+
+
+def test_a_flash_that_fails_to_draw_still_ends(monkeypatch):
+    ov, drawn, timers = _overlay(monkeypatch)
+
+    def boom(*a, **k):
+        raise RuntimeError("AppKit said no")
+
+    monkeypatch.setattr(ov, "_show", boom)
+    try:
+        ov.flash_error("x")
+    except RuntimeError:
+        pass
+    assert timers, "the flash must end even if it never drew"
+
+
+def test_a_message_over_a_recording_is_kept_short(monkeypatch):
+    ov, drawn, timers = _overlay(monkeypatch)
+    delays = []
+    monkeypatch.setattr(ov, "_end_flash_after", lambda d, gen: delays.append(d))
+    ov.show("recording")
+    ov.flash_error("No connection · retry in 10s, and a long tail of words here")
+    assert delays == [o.RECORDING_FLASH_MAX_SEC]

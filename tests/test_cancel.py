@@ -19,13 +19,13 @@ class _Overlay:
     def __init__(self):
         self.events = []
 
-    def hide(self, token=None):
-        self.events.append(("hide", token))
+    def hide(self, **_):
+        self.events.append(("hide", None))
 
-    def show(self, mode, label=None, token=None):
+    def show(self, mode, label=None, queued=0, **_):
         self.events.append((mode, label))
 
-    def flash_error(self, message=None, duration=None, token=None):
+    def flash_error(self, message=None, duration=None, **_):
         self.events.append(("error", message))
 
     def flash_notice(self, message, duration=None, sound=True):
@@ -54,6 +54,15 @@ def _wav(path, age_sec=None):
     return path
 
 
+def _queue(job_id, wav, started=None):
+    job = main.Job(job_id, main.MODE_DICTATE)
+    job.path = wav
+    if started is not None:
+        job.started = started
+    main._jobs[job_id] = job
+    return wav
+
+
 @pytest.fixture
 def app(monkeypatch, tmp_path):
     overlay = _Overlay()
@@ -62,7 +71,6 @@ def app(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "FALLBACK_PENDING_DIR", tmp_path / "fallback")
     monkeypatch.setattr(main, "QUARANTINE_DIR", tmp_path / "quarantine")
     monkeypatch.setattr(main, "state", "idle")
-    monkeypatch.setattr(main, "current_wav_path", None)
     monkeypatch.setattr(main, "copy_to_clipboard", lambda text: None)
     monkeypatch.setattr(main, "_last_cancel_tap", 0.0)
     return overlay
@@ -121,9 +129,7 @@ def test_cancelling_a_live_job_makes_its_worker_abort(app, monkeypatch, tmp_path
     user is doing by then — the same rule the watchdog reset relies on.
     """
     wav = _wav(tmp_path / "20260922-030003-a.dictate.wav")
-    monkeypatch.setattr(main, "state", "processing")
-    monkeypatch.setattr(main, "current_job_id", 7)
-    monkeypatch.setattr(main, "current_wav_path", wav)
+    _queue(7, wav)
     pasted = []
     monkeypatch.setattr(
         main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "late text "
@@ -183,9 +189,7 @@ def test_a_healthy_transcription_is_not_cancellable_yet(app, monkeypatch, tmp_pa
     The whole point of the grace window: a normal transcription takes a second
     or two, and a capital letter typed in that moment must not kill it.
     """
-    _wav(tmp_path / "20260922-030007-a.dictate.wav")
-    monkeypatch.setattr(main, "state", "processing")
-    monkeypatch.setattr(main, "state_ts", 100.0)
+    _queue(1, _wav(tmp_path / "20260922-030007-a.dictate.wav"), started=100.0)
     monkeypatch.setattr(
         main.time, "monotonic", lambda: 100.0 + main.CANCEL_GRACE_SEC - 1
     )
@@ -194,23 +198,29 @@ def test_a_healthy_transcription_is_not_cancellable_yet(app, monkeypatch, tmp_pa
 
     assert app.events == []
     assert not main._pending_cancelled
-    assert main.state == "processing"
+    assert list(main._jobs) == [1]
 
 
 def test_a_stuck_transcription_is_cancellable_after_the_grace(
     app, monkeypatch, tmp_path
 ):
-    _wav(tmp_path / "20260922-030008-a.dictate.wav")
-    monkeypatch.setattr(main, "state", "processing")
-    monkeypatch.setattr(main, "state_ts", 100.0)
+    _queue(1, _wav(tmp_path / "20260922-030008-a.dictate.wav"), started=100.0)
+    # A second take, queued later and still healthy, carries on: the tap is
+    # for what is stuck. Voiding it would leave its file to the retry loop
+    # (too young to be held) while its worker still runs: two requests, and
+    # the text in the clipboard instead of pasted.
+    young = _wav(
+        tmp_path / "20260922-030009-b.dictate.wav", age_sec=1
+    )
+    _queue(2, young, started=100.0 + main.CANCEL_GRACE_SEC)
     monkeypatch.setattr(
         main.time, "monotonic", lambda: 100.0 + main.CANCEL_GRACE_SEC + 1
     )
 
     main.on_cancel_tap()
 
-    assert main.state == "idle"
-    assert main._pending_cancelled
+    assert list(main._jobs) == [2]
+    assert main._pending_cancelled == {"20260922-030008-a.dictate.wav"}
     assert any(k == "notice" for k, _ in app.events)
 
 
@@ -267,7 +277,7 @@ def test_every_caps_lock_press_counts_as_one_tap(app, monkeypatch, tmp_path):
     monkeypatch.setattr(main, "CGEventGetIntegerValueField", _fake_keycode)
 
     # Press on (flag set), press off (flag clear): two presses, two taps.
-    main.tap_callback(None, main.kCGEventFlagsChanged, _Event(main.CANCEL_FLAG), None)
+    main.tap_callback(None, main.kCGEventFlagsChanged, _Event(0x10000), None)
     main.tap_callback(None, main.kCGEventFlagsChanged, _Event(0), None)
 
     assert len(taps) == 2

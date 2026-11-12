@@ -18,9 +18,9 @@ Open-source speech-to-text for macOS, built on [Mistral](https://mistral.ai). Fr
 | Hold **right ⌘** or **right ⌥** | Dictate |
 | **Right ⌘ + right ⌥** | Dictate hands-free. Tap either key to stop |
 | Hold **right ⇧** | Speak Russian, paste English |
-| **Caps Lock** | Cancel a stuck transcription. The audio is kept |
+| **Caps Lock** | Cancel a transcription stuck for over 10 s. The audio is kept; tap twice to retry it now |
 
-Text is pasted at the cursor and stays in the clipboard.
+Start the next take while the last one is still transcribing: they paste in the order you spoke. Text is pasted at the cursor and stays in the clipboard; if it can't be pasted, the pill says **Copied · ⌘V**.
 
 ## Install
 
@@ -30,7 +30,7 @@ Requires macOS 13+ and a [Mistral API key](https://console.mistral.ai/api-keys) 
 
 ```text
 Install OpenSpeaksy on my Mac: https://github.com/slilbudget/OpenSpeaksy
-Follow AGENTS.md in the repo. Ask me for my Mistral API key when you need it.
+Follow AGENTS.md in the repo. When you need my Mistral API key, I'll copy it to the clipboard.
 ```
 
 **Manually:**
@@ -40,20 +40,27 @@ git clone https://github.com/slilbudget/OpenSpeaksy.git ~/OpenSpeaksy
 cd ~/OpenSpeaksy && ./scripts/install.sh
 ```
 
-Then, either way: **System Settings → Privacy & Security** → allow `~/OpenSpeaksy/venv/bin/python` under **Input Monitoring** and **Accessibility**.
+Then, either way: **System Settings → Privacy & Security** → allow `~/OpenSpeaksy/venv/bin/python` under **Input Monitoring** and **Accessibility**, and allow the **Microphone** prompt on the first recording.
 
 ## Settings
 
 Optional, in `~/Library/LaunchAgents/com.openspeaksy.plist` → `EnvironmentVariables`:
 
-| Variable | Default | |
+| Variable | Default | Effect |
 |:---|:---|:---|
 | `OPENSPEAKSY_DICTATE_LANGUAGE` | auto | Force a language, e.g. `en` |
-| `MISTRAL_MODEL` | `voxtral-small-transcribe-3` | Speech-to-text model. Falls back to `voxtral-mini-2602` (`MISTRAL_FALLBACK_MODEL`) when refused |
-| `MISTRAL_TRANSLATION_MODEL` | `mistral-large-4` | Translation model. Falls back to `ministral-8b-latest` on failure |
-| `OPENSPEAKSY_COMMAND_MOOD` | `0` | `1`: Russian "проверю" → "проверь" unless the sentence has "я" or a "не"/"если" before it. For dictating to AI agents |
+| `MISTRAL_MODEL` | `voxtral-small-transcribe-3` | Speech-to-text model |
+| `MISTRAL_FALLBACK_MODEL` | `voxtral-mini-2602` | Used when the main model refuses a take. Set it equal to `MISTRAL_MODEL` to turn it off |
+| `MISTRAL_TRANSLATION_MODEL` | `mistral-large-4` | Translation model |
+| `MISTRAL_TRANSLATION_FALLBACK_MODEL` | `ministral-8b-latest` | Used once when translation fails. Set it equal to `MISTRAL_TRANSLATION_MODEL` to turn it off |
+| `OPENSPEAKSY_COMMAND_MOOD` | `0` | `1`: Russian "проверю" → "проверь", unless the sentence has "я" or не/ни/если/когда/пока/чтобы/как within three words before the verb. For dictating to AI agents |
 
-Apply with `launchctl unload` then `launchctl load` on that plist.
+Apply with:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.openspeaksy.plist
+launchctl load ~/Library/LaunchAgents/com.openspeaksy.plist
+```
 
 **Vocabulary.** Jargon, slang or names it mishears: copy [`vocabulary.example.txt`](vocabulary.example.txt) to `vocabulary.txt` and list them, one per line. A `heard => written` line fixes a word that still comes out wrong; a `term = meaning` line tells the translator what your jargon means. Applies on the next dictation.
 
@@ -67,6 +74,7 @@ Audio goes only to Mistral, under your key. No telemetry; transcripts and the ke
 |:---|:---|
 | Nothing happens | Allow **Input Monitoring** |
 | Doesn't paste | Allow **Accessibility** |
+| Pill says **Mic blocked** | Allow **Microphone** |
 | Caps Lock types capitals | Keyboard → Modifier Keys → Caps Lock → **No Action** |
 | Anything else | `tail -f ~/Library/Logs/com.openspeaksy/main.log` |
 

@@ -1,5 +1,6 @@
 import math
 import threading
+import time
 import objc
 from AppKit import (
     NSView, NSPanel, NSColor, NSBezierPath, NSScreen, NSFont,
@@ -34,10 +35,12 @@ ERROR_TEXT_PAD_X = 14      # breathing room inside the pill, per side
 ERROR_MAX_W = 420          # wrap beyond this; keeps the pill off screen edges
 ERROR_LINE_GAP = 3.0
 ERROR_MIN_H = H
-ERROR_MAX_CHARS = 220      # Beyond this it stops being a glanceable notice
+ERROR_MAX_CHARS = 90       # Beyond this it stops being a glanceable notice
 ERROR_FLASH_SEC = 1.2      # Bare "!" flash, and the floor for a message
 ERROR_CHARS_PER_SEC = 22.0 # Rough comfortable reading pace
 ERROR_MESSAGE_MAX_SEC = 6.0
+# Longest a message may cover a recording: the user has to see it records.
+RECORDING_FLASH_MAX_SEC = 2.0
 
 # The panel must fit the TALLEST state, not the common one: a wrapped error
 # message is several lines high, and a panel sized for the glyph would clip it.
@@ -67,6 +70,17 @@ EDGE_RGBA = (1.0, 1.0, 1.0, 0.14)      # Soft light hairline rim
 BAR_RGBA = (190 / 255, 190 / 255, 190 / 255, 1.0)    # Bars / spinner — #bebebe
 BORDER_W = 1.0
 
+# Queue dots: one per take the main glyph is not already showing — under a
+# recording, every take still transcribing; under the spinner, the ones
+# waiting behind it. They sit on a small capsule of the pill's own fill in the
+# margin under the pill, so they read on a white page as well as a dark one.
+DOT_D = 3.0
+DOT_GAP = 3.5
+DOT_MAX = 6
+DOT_RGBA = (190 / 255, 190 / 255, 190 / 255, 0.95)
+DOT_PAD_X = 4.0            # capsule padding around the row of dots
+DOT_PAD_Y = 2.5
+
 # Mode label ("English" / "Hands-free") — small soft rounded type.
 LABEL_SIZE = 9.5
 LABEL_TRACKING = 0.2       # Slight letter spacing for an airy, minimal look
@@ -85,6 +99,7 @@ NOTICE_SOUND = "Glass"
 
 FILL = None
 EDGE = None
+DOT_COLOR = None
 BAR_COLOR = None           # Recording bars / loading arc
 ERROR_BAR = None           # Error "!"
 LABEL_ATTRS = None
@@ -94,10 +109,12 @@ CLEAR = None
 
 def _init_colors():
     global FILL, EDGE, BAR_COLOR, ERROR_BAR, LABEL_ATTRS, ERROR_ATTRS, CLEAR, _EASE
+    global DOT_COLOR
     if BAR_COLOR is None:
         c = NSColor.colorWithRed_green_blue_alpha_
 
         FILL = c(*FILL_RGBA)
+        DOT_COLOR = c(*DOT_RGBA)
         EDGE = c(*EDGE_RGBA)
         BAR_COLOR = c(*BAR_RGBA)
         ERROR_BAR = c(236 / 255, 112 / 255, 102 / 255, 1.0)
@@ -175,6 +192,15 @@ def _error_frame(message):
     return NSMakeRect((PANEL_W - w) / 2.0, PAD, w, h)
 
 
+def _queue_dots(mode, queued):
+    """How many queue dots to draw under the pill in this mode."""
+    if mode == "recording":
+        return min(queued, DOT_MAX)
+    if mode == "loading":
+        return min(max(queued - 1, 0), DOT_MAX)
+    return 0
+
+
 def _full_frame():
     return NSMakeRect((PANEL_W - W) / 2.0, PAD, W, H)
 
@@ -225,6 +251,7 @@ class OverlayView(NSView):
             self._mode = None
             self._label = None
             self._message = None
+            self._queued = 0
             self._phase = 0.0
             _init_colors()
             self.setWantsLayer_(True)
@@ -259,6 +286,11 @@ class OverlayView(NSView):
     def setLabel_(self, label):
         if self._label != label:
             self._label = label
+            self._glyph.setNeedsDisplay_(True)
+
+    def setQueued_(self, queued):
+        if self._queued != queued:
+            self._queued = queued
             self._glyph.setNeedsDisplay_(True)
 
     def setMessage_(self, message):
@@ -316,6 +348,24 @@ class OverlayView(NSView):
 
         cx, cy = PANEL_W / 2.0, PAD + H / 2.0
 
+        dots = _queue_dots(self._mode, self._queued)
+        if dots:
+            row = dots * DOT_D + (dots - 1) * DOT_GAP
+            x0 = cx - row / 2.0
+            y = (PAD - DOT_D) / 2.0
+            capsule = NSMakeRect(
+                x0 - DOT_PAD_X, y - DOT_PAD_Y,
+                row + 2 * DOT_PAD_X, DOT_D + 2 * DOT_PAD_Y,
+            )
+            r = capsule.size.height / 2.0
+            FILL.setFill()
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(capsule, r, r).fill()
+            DOT_COLOR.setFill()
+            for i in range(dots):
+                NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(x0 + i * (DOT_D + DOT_GAP), y, DOT_D, DOT_D)
+                ).fill()
+
         if self._mode in _MESSAGE_MODES:
             if self._message:
                 # Center the wrapped text on the pill the surface animated to,
@@ -371,78 +421,73 @@ class OverlayView(NSView):
 
 
 class Overlay:
+    """
+    The pill. Callers describe the current state with show()/hide() — the
+    "base" — and flash a message over it with flash_error()/flash_notice().
+    A flash never ends the base: when it times out, the pill goes back to
+    whatever the base is by then, so an error from one take cannot cover or
+    take down the recording of the next.
+    """
+
     def __init__(self):
         self._panel = None
         self._view = None
         self._timer = None
         self._hiding = False
-        # Bumped on every _show. The error-flash timer captures the value at
-        # flash time, so a flash can never hide a cycle that started after it.
+        # Bumped on every _show. A flash's timer captures the value, so only
+        # the most recent flash can end the flashing.
         self._gen = 0
-        # Caller-supplied owner of what is on screen (the job id, in practice).
-        # A worker finishing after the next cycle already began must not hide
-        # that cycle's pill: state goes idle at the worker's claim, so a new
-        # recording can legitimately start while the worker is still pasting.
-        self._token = None
+        self._base = None          # (mode, label, queued) or None for hidden
+        self._flashing = False
+        self._flash_started = 0.0
 
-    def show(self, mode, label=None, token=None):
-        AppHelper.callAfter(self._show, mode, label, None, token)
+    def show(self, mode, label=None, queued=0):
+        AppHelper.callAfter(self._set_base, (mode, label, queued))
 
-    def flash_error(self, message=None, duration=None, token=None):
+    def hide(self):
+        AppHelper.callAfter(self._set_base, None)
+
+    def flash_error(self, message=None, duration=None):
         """
         Show the error pill. With a message the pill widens to fit it and stays
-        up long enough to read; without one it is the old compact "!" flash.
-
-        A token means "only if this cycle still owns the pill" — same reason
-        hide() takes one. A worker that failed after the user already started
-        the next recording would otherwise cover that recording's pill with a
-        stale error and then take it down mid-sentence. The failure is in the
-        log either way, and the audio is preserved for the retry loop.
+        up long enough to read; without one it is the compact "!" flash.
         """
         message = _clean_message(message)
         if duration is None:
             duration = _read_time(message) if message else ERROR_FLASH_SEC
-        AppHelper.callAfter(self._flash_error, message, duration, token)
+        AppHelper.callAfter(self._flash, "error", message, duration, False)
 
     def flash_notice(self, message, duration=None, sound=True):
         """
-        Show a neutral message pill — used when a recovered transcript lands in
-        the clipboard. Deliberately untokened: a recovery is not part of any
-        recording cycle, and the user needs to know their clipboard changed
-        even if they have since started dictating again.
+        A neutral message pill — e.g. a recovered transcript landing in the
+        clipboard, which the user needs to know about even mid-dictation.
         """
         message = _clean_message(message)
         if duration is None:
             duration = _read_time(message)
-        AppHelper.callAfter(self._flash_notice, message, duration, sound)
+        AppHelper.callAfter(self._flash, "notice", message, duration, sound)
 
-    def hide(self, token=None):
-        """
-        Take the pill down. With a token it is taken down only if that token
-        still owns what is on screen, so a late worker cannot collapse the
-        overlay of a cycle that started after it.
-        """
-        AppHelper.callAfter(self._hide_owned, token)
+    def _set_base(self, base):
+        recording = base is not None and base[0] == "recording"
+        was_recording = self._base is not None and self._base[0] == "recording"
+        self._base = base
+        if not self._flashing:
+            self._render_base()
+        elif recording and not was_recording:
+            # A take just started under a long message (an earlier take's
+            # error). The user must see it is recording: cut the message
+            # short, once it has been up long enough to be glanced at.
+            left = RECORDING_FLASH_MAX_SEC - (time.monotonic() - self._flash_started)
+            self._end_flash_after(max(left, 0.0), self._gen)
 
-    def _hide_owned(self, token):
-        if token is not None and self._token != token:
-            return
-        self._hide()
+    def _render_base(self):
+        if self._base is None:
+            self._hide()
+        else:
+            mode, label, queued = self._base
+            self._show(mode, label, None, queued)
 
-    def _flash_error(self, message, duration, token=None):
-        if token is not None and self._token != token:
-            return
-        self._show("error", None, message, token)
-        gen = self._gen
-        # daemon, so a pending hide never holds the process open on shutdown:
-        # the pill is going away with the app anyway.
-        timer = threading.Timer(
-            duration, lambda: AppHelper.callAfter(self._hide_if_current, gen)
-        )
-        timer.daemon = True
-        timer.start()
-
-    def _flash_notice(self, message, duration, sound):
+    def _flash(self, mode, message, duration, sound):
         if sound:
             try:
                 tone = NSSound.soundNamed_(NOTICE_SOUND)
@@ -451,17 +496,31 @@ class Overlay:
             except Exception:
                 # A missing system sound must never cost the user the notice.
                 pass
-        self._show("notice", None, message, None)
-        gen = self._gen
+        if self._base is not None and self._base[0] == "recording":
+            duration = min(duration, RECORDING_FLASH_MAX_SEC)
+        self._flashing = True
+        self._flash_started = time.monotonic()
+        try:
+            self._show(mode, None, message)
+        finally:
+            # Always armed: a flash whose drawing failed must still end, or
+            # every later show()/hide() would wait behind it forever.
+            self._end_flash_after(duration, self._gen)
+
+    def _end_flash_after(self, delay, gen):
+        # daemon, so a pending timer never holds the process open on shutdown:
+        # the pill is going away with the app anyway.
         timer = threading.Timer(
-            duration, lambda: AppHelper.callAfter(self._hide_if_current, gen)
+            delay, lambda: AppHelper.callAfter(self._end_flash, gen)
         )
         timer.daemon = True
         timer.start()
 
-    def _hide_if_current(self, gen):
-        if gen == self._gen:
-            self._hide()
+    def _end_flash(self, gen):
+        if gen != self._gen:
+            return  # a later flash owns the pill now
+        self._flashing = False
+        self._render_base()
 
     def _center(self):
         # Bottom-left of the glyph-sized pill on screen. The panel is a fixed
@@ -508,16 +567,16 @@ class Overlay:
         self._panel = panel
         self._view = view
 
-    def _show(self, mode, label, message=None, token=None):
+    def _show(self, mode, label, message=None, queued=0):
         _init_colors()
         self._ensure_panel()
         self._hiding = False
         self._gen += 1
-        self._token = token
 
         self._panel.setFrameOrigin_(self._panel_origin())
         self._view.setLabel_(label)
         self._view.setMessage_(message)
+        self._view.setQueued_(queued)
         self._view.setMode_(mode)
 
         # The redraw timer runs only while the pill is visible.

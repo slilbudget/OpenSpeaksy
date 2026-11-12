@@ -138,6 +138,8 @@ def test_command_mood_turns_misheard_first_person_into_imperative():
     assert commands("Проверю код, напишу тесты и посмотрю логи") == "Проверь код, напиши тесты и посмотри логи"
     assert commands("Сделаю коротко. ПОПРОБУЮ ещё") == "Сделай коротко. ПОПРОБУЙ ещё"
     assert commands("Пофикшу кнопку") == "Пофикси кнопку"
+    # An adjective that only looks like an -изую verb stays as it is.
+    assert commands("Сизую рубашку") == "Сизую рубашку"
 
 
 def test_command_mood_keeps_real_first_person_and_other_words():

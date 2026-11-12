@@ -27,6 +27,15 @@ def _no_personal_vocabulary(monkeypatch, tmp_path):
 
 
 @pytest.fixture(autouse=True)
+def _no_held_keys(monkeypatch):
+    """The real check reads this Mac's keyboard; tests decide it themselves."""
+    import main
+
+    monkeypatch.setattr(main, "_modifiers_held", lambda: False)
+    monkeypatch.setattr(main, "PASTE_SETTLE_SEC", 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _reset_pending_retry_state():
     """
     The pending failure counts and the backoff schedule are module globals, so
@@ -46,3 +55,8 @@ def _clear(main):
     main._pending_attempt_count.clear()
     main._pending_cancelled.clear()
     main._last_cancel_tap = 0.0
+    main._jobs.clear()
+    main._last_paste_at = 0.0
+    main._drain_recheck_armed = False
+    main._held_since = None
+    main._recovered_text.clear()

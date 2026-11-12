@@ -28,10 +28,12 @@ def test_shutdown_preserves_active_recording(monkeypatch, tmp_path):
         lambda audio, mode: saved.append((len(audio), mode)) or tmp_path / "saved.wav",
     )
     monkeypatch.setattr(main.os, "_exit", exit_process)
+    main._jobs[1] = main.Job(1, main.MODE_DICTATE)
 
     with pytest.raises(ExitCalled):
         main.handle_shutdown(15, None)
 
+    assert main._jobs == {}     # no worker may paste while the process goes down
     assert saved == [(main.MIN_AUDIO_SAMPLES, main.MODE_DICTATE)]
     assert main.state == "idle"
     assert main.current_hotkey is None

@@ -21,13 +21,13 @@ class _Overlay:
     def __init__(self):
         self.events = []
 
-    def hide(self, token=None):
-        self.events.append(("hide", token))
+    def hide(self, **_):
+        self.events.append(("hide", None))
 
-    def show(self, mode, label=None, token=None):
+    def show(self, mode, label=None, queued=0, **_):
         self.events.append((mode, label))
 
-    def flash_error(self, message=None, duration=None, token=None):
+    def flash_error(self, message=None, duration=None, **_):
         self.events.append(("error", message))
 
 
@@ -47,14 +47,21 @@ def _wav(path, loud=True):
 
 @pytest.fixture
 def worker(monkeypatch, tmp_path):
-    """A processing job that owns the current generation."""
+    """Job 7 queued and transcribing; each test hands it a file with _queue."""
     overlay = _Overlay()
     monkeypatch.setattr(main, "overlay", overlay)
-    monkeypatch.setattr(main, "state", "processing")
+    monkeypatch.setattr(main, "state", "idle")
     monkeypatch.setattr(main, "current_job_id", 7)
     monkeypatch.setattr(main, "PENDING_DIR", tmp_path)
     monkeypatch.setattr(main, "QUARANTINE_DIR", tmp_path / "quarantine")
     return overlay
+
+
+def _queue(job_id, wav, mode=main.MODE_DICTATE):
+    job = main.Job(job_id, mode)
+    job.path = wav
+    main._jobs[job_id] = job
+    return wav
 
 
 def test_a_rejected_recording_is_quarantined_not_retried_forever(
@@ -66,7 +73,7 @@ def test_a_rejected_recording_is_quarantined_not_retried_forever(
     the rest of the session. Set it aside instead: the audio is kept, the queue
     stops eating quota on it, and the user is told why.
     """
-    wav = _wav(tmp_path / "20260827-000000-abc.dictate.wav")
+    wav = _queue(7, _wav(tmp_path / "20260827-000000-abc.dictate.wav"))
     monkeypatch.setattr(
         main.transcriber,
         "transcribe_dictation_sync",
@@ -79,7 +86,7 @@ def test_a_rejected_recording_is_quarantined_not_retried_forever(
 
     assert not wav.exists()
     assert (tmp_path / "quarantine" / wav.name).exists()
-    assert ("error", "Recording is too long to transcribe") in worker.events
+    assert ("error", "Too long") in worker.events
 
 
 def test_a_take_with_nothing_recognized_is_set_aside_quietly(
@@ -90,7 +97,7 @@ def test_a_take_with_nothing_recognized_is_set_aside_quietly(
     returning no text, used to sit behind an error pill for 9 minutes of
     retries. It goes straight to quarantine, audio kept, with a plain notice.
     """
-    wav = _wav(tmp_path / "20261029-000000-abc.dictate.wav")
+    wav = _queue(7, _wav(tmp_path / "20261029-000000-abc.dictate.wav"))
     monkeypatch.setattr(
         main.transcriber,
         "transcribe_dictation_sync",
@@ -101,13 +108,13 @@ def test_a_take_with_nothing_recognized_is_set_aside_quietly(
 
     assert not wav.exists()
     assert (tmp_path / "quarantine" / wav.name).exists()
-    assert ("error", "Nothing recognized") in worker.events
+    assert ("error", "No speech") in worker.events
 
 
 def test_a_transient_failure_keeps_the_recording_for_retry(
     worker, monkeypatch, tmp_path
 ):
-    wav = _wav(tmp_path / "20260827-000001-abc.dictate.wav")
+    wav = _queue(7, _wav(tmp_path / "20260827-000001-abc.dictate.wav"))
     monkeypatch.setattr(
         main.transcriber,
         "transcribe_dictation_sync",
@@ -122,19 +129,11 @@ def test_a_transient_failure_keeps_the_recording_for_retry(
     assert not (tmp_path / "quarantine").exists()
     # The countdown is the point: a saved, scheduled recording must not read
     # like a lost one.
-    assert (
-        "error",
-        "No connection to the transcription service — retrying in 10s",
-    ) in worker.events
+    assert ("error", "No connection · retry in 10s") in worker.events
 
 
-def test_the_worker_hides_only_its_own_overlay_cycle(worker, monkeypatch, tmp_path):
-    """
-    The worker claims the job and state goes idle BEFORE the paste, so the user
-    can legitimately start a new recording while it is still pasting. Passing
-    the job id means a late hide cannot collapse the new cycle's pill.
-    """
-    wav = _wav(tmp_path / "20260827-000002-abc.dictate.wav")
+def test_the_pill_goes_away_once_the_queue_is_empty(worker, monkeypatch, tmp_path):
+    wav = _queue(7, _wav(tmp_path / "20260827-000002-abc.dictate.wav"))
     monkeypatch.setattr(
         main.transcriber, "transcribe_dictation_sync", lambda *a, **k: "text "
     )
@@ -142,11 +141,12 @@ def test_the_worker_hides_only_its_own_overlay_cycle(worker, monkeypatch, tmp_pa
 
     main.process_pending_recording(wav, 7, main.MODE_DICTATE)
 
-    assert ("hide", 7) in worker.events
+    assert worker.events[-1] == ("hide", None)
+    assert not wav.exists()
 
 
 def test_a_stale_worker_touches_nothing(worker, monkeypatch, tmp_path):
-    """A watchdog reset bumped the generation; this worker lost its claim."""
+    """A cancel or the watchdog voided job 3; only job 7 is queued."""
     wav = _wav(tmp_path / "20260827-000003-abc.dictate.wav")
     pasted = []
     monkeypatch.setattr(
@@ -169,7 +169,6 @@ def recovery(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "FALLBACK_PENDING_DIR", tmp_path / "fallback")
     monkeypatch.setattr(main, "QUARANTINE_DIR", tmp_path / "quarantine")
     monkeypatch.setattr(main, "state", "idle")
-    monkeypatch.setattr(main, "current_wav_path", None)
     clipboard = []
     monkeypatch.setattr(main, "copy_to_clipboard", clipboard.append)
     return clipboard
@@ -185,7 +184,7 @@ def test_recovery_leaves_the_live_workers_recording_alone(
     """
     live = _wav(tmp_path / "20260827-000010-live.dictate.wav")
     queued = _wav(tmp_path / "20260827-000009-old.dictate.wav")
-    monkeypatch.setattr(main, "current_wav_path", live)
+    _queue(1, live)
     seen = []
 
     def _transcribe(path, language=None):
@@ -198,8 +197,19 @@ def test_recovery_leaves_the_live_workers_recording_alone(
 
     assert seen == [queued]
     assert live.exists()
-    assert not queued.exists()
+    # The live take would paste over the recovered text a moment later, so
+    # nothing is handed over yet and the file stays...
+    assert recovery == []
+    assert queued.exists()
+
+    # ...until nothing is live; then it lands without a second request.
+    main._jobs.clear()
+    live.unlink()                       # the live take pasted and let go
+    main._pending_next_attempt.clear()
+    main.recover_pending_recordings()
+    assert seen == [queued]
     assert recovery == ["recovered "]
+    assert not queued.exists()
 
 
 def test_recovery_quarantines_a_payload_the_provider_refuses(
@@ -245,16 +255,32 @@ def test_recovery_does_not_hold_the_clipboard_gate_across_the_network(
     assert held_during_network == [False]
 
 
-def test_the_retry_loop_skips_a_pass_while_a_job_is_in_flight(monkeypatch):
-    monkeypatch.setattr(main, "state", "processing")
-    monkeypatch.setattr(main, "current_wav_path", None)
+@pytest.mark.parametrize("state, job, runs", [
+    ("idle", True, False),
+    ("recording", False, False),
+    ("idle", False, True),
+])
+def test_the_retry_loop_skips_a_pass_while_anything_is_live(
+    monkeypatch, tmp_path, state, job, runs
+):
+    monkeypatch.setattr(main, "state", state)
+    if job:
+        _queue(1, tmp_path / "x.dictate.wav")
     ran = []
     monkeypatch.setattr(main, "recover_pending_recordings", lambda: ran.append(1))
-    monkeypatch.setattr(main.time, "sleep", lambda _s: (_ for _ in ()).throw(_Stop()))
+    slept = []
+
+    def sleep(_s):
+        # The first sleep lets one pass run; the second ends the loop.
+        slept.append(1)
+        if len(slept) > 1:
+            raise _Stop()
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
 
     with pytest.raises(_Stop):
         main.pending_retry_loop()
-    assert ran == []
+    assert ran == ([1] if runs else [])
 
 
 class _Stop(Exception):
@@ -322,18 +348,16 @@ def test_watchdog_processing_timeout_preserves_the_recording(monkeypatch, tmp_pa
     overlay = _Overlay()
     wav = _wav(tmp_path / "20260827-000017-a.dictate.wav")
     monkeypatch.setattr(main, "overlay", overlay)
-    monkeypatch.setattr(main, "state", "processing")
-    monkeypatch.setattr(main, "state_ts", -main.PROCESSING_TIMEOUT_SEC * 2)
-    monkeypatch.setattr(main, "current_wav_path", wav)
-    monkeypatch.setattr(main, "current_job_id", 4)
+    monkeypatch.setattr(main, "state", "idle")
+    monkeypatch.setattr(main, "_schedule_drain", lambda: None)
+    _queue(4, wav).parent
+    main._jobs[4].started = main.time.monotonic() - main.PROCESSING_TIMEOUT_SEC * 2
 
     main._watchdog_tick()
 
-    assert main.state == "idle"
-    assert main.current_job_id == 5
-    assert main.current_wav_path is None
+    assert main._jobs == {}
     assert wav.exists()
-    assert ("error", "Transcription timed out, saved for retry") in overlay.events
+    assert ("error", "Timed out · saved") in overlay.events
 
 
 def test_translate_mode_survives_recovery(recovery, monkeypatch, tmp_path):
@@ -357,7 +381,7 @@ def test_translate_mode_survives_recovery(recovery, monkeypatch, tmp_path):
 
 def test_processing_error_message_carries_the_providers_wait(worker, monkeypatch, tmp_path):
     """End to end: a provider 429 body becomes a number on screen."""
-    wav = _wav(tmp_path / "20260827-000020-a.dictate.wav")
+    wav = _queue(7, _wav(tmp_path / "20260827-000020-a.dictate.wav"))
     monkeypatch.setattr(
         main.transcriber,
         "transcribe_dictation_sync",
@@ -372,7 +396,7 @@ def test_processing_error_message_carries_the_providers_wait(worker, monkeypatch
 
     main.process_pending_recording(wav, 7, main.MODE_DICTATE)
 
-    assert ("error", "Rate limited — retrying in 35s") in worker.events
+    assert ("error", "Rate limited · retry in 35s") in worker.events
     assert wav.exists()
 
 
@@ -399,7 +423,7 @@ def test_shutdown_waits_for_an_in_flight_save(monkeypatch):
     process on top of it, losing audio that existed only in a local variable.
     """
     order = []
-    monkeypatch.setattr(main, "state", "processing")
+    monkeypatch.setattr(main, "state", "idle")
     monkeypatch.setattr(main, "current_mode", None)
     monkeypatch.setattr(main, "os", _ExitRecorder(order))
 

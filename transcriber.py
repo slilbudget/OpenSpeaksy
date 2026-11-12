@@ -154,6 +154,29 @@ HTTP_BODY_READ_LIMIT = 4096
 HTTP_BODY_KEEP_CHARS = 500
 
 
+def _without_echo(raw):
+    """
+    A validation error can quote the request back ("input": the field's
+    value), and for a chat call that value is the dictation. Error text goes
+    to the log and the pill, where dictated words must never land, so a JSON
+    body loses every "input" before it is kept. type and code stay: they are
+    what tells a capacity shortage from a spent quota.
+    """
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        return raw
+
+    def strip(node):
+        if isinstance(node, dict):
+            return {k: strip(v) for k, v in node.items() if k != "input"}
+        if isinstance(node, list):
+            return [strip(v) for v in node]
+        return node
+
+    return json.dumps(strip(body), ensure_ascii=False)
+
+
 def _http_error_text(error):
     """
     The status line PLUS the provider's own explanation from the response body.
@@ -182,7 +205,7 @@ def _http_error_text(error):
             pass
     if not raw:
         return base
-    detail = " ".join(raw.split())
+    detail = " ".join(_without_echo(raw).split())
     if not detail:
         return base
     # Mistral's error bodies are flat ({"message", "type", "code"}), and the
@@ -323,7 +346,9 @@ def is_capacity_shortage(error):
     else:
         text = str(error).lower()
     compact = text.replace(" ", "")
-    return "backend_out_of_capacity" in compact or '"code":"3505"' in compact
+    return "backend_out_of_capacity" in compact or any(
+        code in compact for code in ('"code":"3505"', '"code":3505')
+    )
 
 
 def _retry_delay(error, attempt):
@@ -462,7 +487,7 @@ def _chat_text(result):
     # A reasoning model answers with a list of blocks: "thinking", then "text".
     if isinstance(content, list):
         content = "".join(
-            block.get("text", "")
+            block.get("text") or ""
             for block in content
             if isinstance(block, dict) and block.get("type") == "text"
         )
@@ -544,7 +569,7 @@ def load_vocabulary(path=None):
         with open(path, encoding="utf-8-sig") as f:
             lines = f.read().splitlines()
     except (OSError, UnicodeDecodeError) as e:
-        logger.warning(f"vocabulary {path} unreadable, ignoring it: {e}")
+        logger.warning(f"vocabulary {os.path.basename(path)} unreadable, ignoring it: {e}")
         _vocabulary_cache = (key, Vocabulary())
         return _vocabulary_cache[1]
 
@@ -637,7 +662,7 @@ _COMMAND_FORMS = {
 # break; a dot inside "v1.2" or "т.е." does not end it.
 _SENTENCE = re.compile(r"(?:[^.!?\n]|[.!?](?=\S))+[.!?]*")
 _FIRST_PERSON_VERB = re.compile(
-    r"(?<!\w)(?:(\w+(?:ир|из))ую|("
+    r"(?<!\w)(?:(\w{3,}(?:ир|из))ую|("
     + "|".join(sorted(_COMMAND_FORMS, key=len, reverse=True))
     + r"))(?!\w)",
     re.IGNORECASE,
@@ -917,9 +942,11 @@ class Transcriber:
             validate=lambda result: _transcription_text(result, wav_path),
             timeout=REQUEST_TIMEOUT_SEC
             + audio_minutes * TRANSCRIPTION_TIMEOUT_SEC_PER_AUDIO_MIN,
-            # With a fallback model at hand, one refusal is enough: the other
-            # model gets the take at once instead of after the retry ladder.
-            retry_throttling=not fail_fast,
+            # A non-capacity 429 is a spent allowance: retrying it within
+            # seconds only spends more of it. The take goes to the fallback
+            # model, or to the retry loop's backoff. A capacity refusal still
+            # waits (capacity_max_attempts).
+            retry_throttling=False,
             capacity_max_attempts=1 if fail_fast else CAPACITY_MAX_ATTEMPTS,
             request_max_attempts=1 if fail_fast else REQUEST_MAX_ATTEMPTS,
         )

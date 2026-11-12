@@ -24,7 +24,7 @@ clearly-isolated branch — see [Issue #1](https://github.com/slilbudget/OpenSpe
 ## Before sending a PR
 
 1. Read [`AGENTS.md`](AGENTS.md). It documents the invariants the codebase
-   relies on (state machine, per-job tokens, atomic writes, no-paste-on-recovery).
+   relies on (state machine, the take queue, atomic writes, no-paste-on-recovery).
 2. Run the checks locally:
    ```bash
    python -m py_compile main.py recorder.py transcriber.py overlay.py

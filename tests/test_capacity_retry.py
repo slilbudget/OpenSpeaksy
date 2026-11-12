@@ -133,8 +133,8 @@ def test_overlay_wording_separates_capacity_from_quota():
     quota = "HTTP Error 429: Too Many Requests: " + json.dumps(QUOTA_BODY)
     capacity = "HTTP Error 429: Too Many Requests: " + json.dumps(CAPACITY_BODY)
 
-    assert main.error_notice(Exception(quota)) == "Rate limited, try again shortly"
-    assert main.error_notice(Exception(capacity)) == "Provider busy, retrying"
+    assert main.error_notice(Exception(quota)) == "Rate limited"
+    assert main.error_notice(Exception(capacity)) == "Mistral busy"
 
 
 def test_oversized_recording_is_rejected_before_the_upload(tmp_path):
@@ -153,3 +153,47 @@ def test_oversized_recording_is_rejected_before_the_upload(tmp_path):
             t.Transcriber()._transcribe_mistral(wav)
 
     assert called == []
+
+
+def test_a_numeric_capacity_code_still_reads_as_capacity():
+    assert t.is_capacity_shortage(_http_error({"message": "full", "code": 3505}))
+    assert not t.is_capacity_shortage(_http_error({"message": "x", "code": 1300}))
+
+
+def test_a_spent_quota_is_not_retried_on_a_transcription(monkeypatch, tmp_path):
+    """Retrying a spent allowance within seconds only spends more of it."""
+    wav = tmp_path / "a.wav"
+    wav.write_bytes(b"RIFF")
+    monkeypatch.setattr(t, "MISTRAL_API_KEY", "test-key")
+    monkeypatch.setattr(t.time, "sleep", lambda s: None)
+    with patch.object(t, "urlopen", side_effect=lambda *a, **k: (_ for _ in ()).throw(
+        _http_error(QUOTA_BODY)
+    )) as urlopen:
+        with pytest.raises(t.TranscriptionError):
+            t.Transcriber()._transcribe_mistral(wav)
+    assert urlopen.call_count == 1
+
+
+def test_an_error_body_never_carries_the_request_back():
+    """A validation error quoting the dictation must not reach the log or pill."""
+    error = _http_error(
+        {
+            "object": "error",
+            "message": {"detail": [{"type": "string_too_long", "input": "мой текст"}]},
+            "type": "invalid_request_error",
+            "code": "3051",
+        },
+        code=422,
+    )
+    text = t._http_error_text(error)
+    assert "мой текст" not in text
+    assert "invalid_request_error" in text and "3051" in text
+
+
+def test_a_null_text_block_does_not_break_a_translation():
+    reply = {"choices": [{"message": {"content": [
+        {"type": "thinking", "thinking": []},
+        {"type": "text", "text": None},
+        {"type": "text", "text": "Hello"},
+    ]}}]}
+    assert t._chat_text(reply) == "Hello"

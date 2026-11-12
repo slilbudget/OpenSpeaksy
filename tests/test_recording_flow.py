@@ -8,13 +8,13 @@ class _Overlay:
     def __init__(self):
         self.events = []
 
-    def hide(self, token=None):
-        self.events.append(("hide", token))
+    def hide(self, **_):
+        self.events.append(("hide", None))
 
-    def show(self, mode, label=None, token=None):
+    def show(self, mode, label=None, queued=0, **_):
         self.events.append((mode, label))
 
-    def flash_error(self, message=None, duration=None, token=None):
+    def flash_error(self, message=None, duration=None, **_):
         # Record the message so tests can assert what the user actually sees.
         self.events.append(("error", message))
 
@@ -41,11 +41,13 @@ def test_recording_above_minimum_is_saved(
             return audio
 
     class Thread:
-        def __init__(self, *, target, args, daemon):
+        def __init__(self, *, target, args=(), daemon):
+            self.target = target
             self.args = args
 
         def start(self):
-            started.append(self.args)
+            if self.target is main.process_pending_recording:
+                started.append(self.args)
 
     wav = tmp_path / "short-word.dictate.wav"
     monkeypatch.setattr(main, "recorder", Recorder())
@@ -61,7 +63,9 @@ def test_recording_above_minimum_is_saved(
 
     assert saved == [(main.MIN_AUDIO_SAMPLES, main.MODE_DICTATE)]
     assert started and started[0][0] == wav
-    assert main.state == "processing"
+    # The recording slot is free for the next take at once; this one is queued.
+    assert main.state == "idle"
+    assert [job.path for job in main._jobs.values()] == [wav]
 
 
 def test_accidental_tap_is_still_ignored(monkeypatch):
@@ -80,7 +84,7 @@ def test_accidental_tap_is_still_ignored(monkeypatch):
     main.on_key_up(main.HOTKEY_KEYCODE)
 
     assert main.state == "idle"
-    assert ("hide", None) in overlay.events
+    assert main._jobs == {}
     assert any("recording ignored" in message for message in logs)
 
 
@@ -94,11 +98,12 @@ def test_worker_start_failure_keeps_saved_wav(monkeypatch, tmp_path):
             return np.zeros(main.MIN_AUDIO_SAMPLES, dtype=np.float32)
 
     class Thread:
-        def __init__(self, *, target, args, daemon):
-            pass
+        def __init__(self, *, target, args=(), daemon):
+            self.target = target
 
         def start(self):
-            raise RuntimeError("thread unavailable")
+            if self.target is main.process_pending_recording:
+                raise RuntimeError("thread unavailable")
 
     def _save(audio, mode):
         wav.write_bytes(b"RIFF----WAVEfmt ")
@@ -112,12 +117,12 @@ def test_worker_start_failure_keeps_saved_wav(monkeypatch, tmp_path):
     main.on_key_up(main.HOTKEY_KEYCODE)
 
     assert main.state == "idle"
-    assert ("error", "Could not start transcription") in overlay.events
+    assert ("error", "Will retry") in overlay.events
     # The point of the test, and previously unasserted: the audio is still on
     # disk for the retry loop. The stub used to return a path it never wrote,
     # so "keeps_saved_wav" was checking nothing.
     assert wav.exists()
-    assert main.current_wav_path is None
+    assert main._jobs == {}
 
 
 def test_recorder_start_failure_flashes_error(monkeypatch):
@@ -138,7 +143,7 @@ def test_recorder_start_failure_flashes_error(monkeypatch):
 
     assert main.state == "idle"
     assert main.current_hotkey is None
-    assert ("error", "Could not start recording") in overlay.events
+    assert ("error", "Mic unavailable") in overlay.events
 
 
 def test_denied_microphone_is_rejected_before_recorder_start(monkeypatch):
@@ -160,7 +165,7 @@ def test_denied_microphone_is_rejected_before_recorder_start(monkeypatch):
 
     assert starts == []
     assert main.state == "idle"
-    assert ("error", "Microphone access is blocked in System Settings") in overlay.events
+    assert ("error", "Mic blocked") in overlay.events
 
 
 def test_primary_save_failure_uses_fallback(monkeypatch, tmp_path):
@@ -204,4 +209,4 @@ def test_both_save_locations_failing_flashes_error(monkeypatch):
     main.on_key_up(main.HOTKEY_KEYCODE)
 
     assert main.state == "idle"
-    assert ("error", "Could not save the recording") in overlay.events
+    assert ("error", "Not saved") in overlay.events

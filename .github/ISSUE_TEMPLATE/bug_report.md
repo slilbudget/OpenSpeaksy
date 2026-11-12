@@ -31,7 +31,7 @@ labels: bug
 Relevant lines from:
 
 - `~/Library/Logs/com.openspeaksy/main.log`
-- `/tmp/openspeaksy.log`
+- `~/Library/Logs/com.openspeaksy/stdout.log`
 
 ```
 paste here

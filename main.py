@@ -25,6 +25,8 @@ from Quartz import (
     kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput,
     CGEventSourceSecondsSinceLastEventType, kCGEventSourceStateHIDSystemState,
     kCGEventKeyDown, kCGEventLeftMouseDown, kCGEventRightMouseDown,
+    CGEventSourceFlagsState, kCGEventFlagMaskAlternate, kCGEventFlagMaskShift,
+    kCGEventFlagMaskControl,
 )
 from CoreFoundation import (
     CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun, kCFRunLoopDefaultMode,
@@ -75,9 +77,8 @@ DICTATION_KEYS = {
 # Verified on the real keyboard rather than from a header: keycode 0x39, flags
 # 0x00010100. Caps Lock still toggles capitals — set it to "No Action" in
 # System Settings > Keyboard > Modifier Keys to avoid that.
-# Down-edge only, so the toggle's own release does not read as a second tap.
+# A toggle: one event per press, so every event is one tap (see tap_callback).
 CANCEL_KEYCODE = 0x39    # Caps Lock
-CANCEL_FLAG    = 0x10000 # NX_ALPHASHIFTMASK — the state bit, not a gate
 # Two taps inside this window mean "try again now" rather than a second cancel.
 CANCEL_DOUBLE_TAP_SEC = 0.6
 # How long a transcription must have been running before a tap can call it off.
@@ -247,7 +248,7 @@ def _microphone_access_is_blocked():
 
 
 def handle_shutdown(signum, _frame):
-    global state, state_ts, current_job_id, current_hotkey, current_mode
+    global state, state_ts, current_hotkey, current_mode
 
     # A key-up already in flight holds the samples in a local variable, a few
     # milliseconds from having them on disk — and this handler exits the process
@@ -261,7 +262,9 @@ def handle_shutdown(signum, _frame):
             mode = current_mode or MODE_DICTATE
             state = "idle"
             state_ts = time.monotonic()
-            current_job_id += 1
+            # Every queued take is already on disk; voiding the jobs keeps a
+            # worker from pasting while the process goes down.
+            _jobs.clear()
             current_hotkey = None
             current_mode = None
     finally:
@@ -274,6 +277,8 @@ def handle_shutdown(signum, _frame):
             if len(audio) >= MIN_AUDIO_SAMPLES:
                 path = save_recording_with_fallback(audio, mode)
                 log(f"shutdown preserved recording: {path.name}")
+            else:
+                log(f"shutdown: recording held only {len(audio)} samples, nothing to keep")
         except Exception as e:
             log(f"shutdown recording preservation error: {e}")
 
@@ -285,21 +290,45 @@ recorder = Recorder()
 transcriber = Transcriber()
 overlay = Overlay()
 
+# The recording slot: "idle" or "recording". Only one take records at a time;
+# any number of finished takes can be transcribing in _jobs meanwhile.
 state = "idle"
 state_ts = time.monotonic()
 state_lock = threading.Lock()
 # Serializes clipboard mutations between live-worker pastes and the
 # background pending-recovery pass, so recovered text can never race a fresh
-# dictation paste into the same clipboard.
+# dictation paste into the same clipboard. Also what keeps pastes in order.
 _clipboard_gate = threading.Lock()
 # Held by on_key_up from the moment the samples leave the recorder until the WAV
 # is on disk. handle_shutdown waits on it, closing the window where a signal
 # would exit the process while the only copy of the audio was a local variable.
 _save_gate = threading.Lock()
-# Per-job token. Each on_key_up bumps this and the spawned worker captures it.
-# A worker may only mutate state/clipboard if its token still matches current_job_id —
-# otherwise it is a stale completion from a watchdog-reset cycle.
+# Id of the last take handed to transcription. Ids only grow, so they are also
+# the order the takes were spoken in.
 current_job_id = 0
+
+
+class Job:
+    """One finished take on its way from the recorder to the paste."""
+
+    __slots__ = ("id", "mode", "path", "started", "done", "text", "notice", "rejected")
+
+    def __init__(self, job_id, mode):
+        self.id = job_id
+        self.mode = mode
+        self.path = None
+        self.started = time.monotonic()
+        self.done = False
+        self.text = None
+        self.notice = None
+        self.rejected = False
+
+
+# Takes being transcribed or waiting for their turn to paste, in the order they
+# were spoken (dicts keep insertion order, and ids are inserted ascending).
+# Guarded by state_lock. A worker whose job is no longer here was voided by a
+# cancel, the watchdog or shutdown: it drops its result, the audio stays queued.
+_jobs = {}
 # Which hotkey owns the in-flight cycle. Set in on_key_down, consumed in on_key_up.
 # A key-up event whose keycode doesn't match current_hotkey is ignored, so tapping
 # the OTHER hotkey mid-record can't end the cycle. Watchdog also clears it on reset.
@@ -309,10 +338,6 @@ current_mode = None
 # _begin_recording for every cycle (and flipped by _latch_hands_free), read only while state is "recording",
 # so the resets that leave "recording" never have to clear it.
 current_hands_free = False
-# Pending WAV owned by the in-flight processing job. Set in on_key_up before
-# the worker spawns; used only for watchdog log messages. Cleared when the
-# job is claimed complete or a new cycle begins.
-current_wav_path = None
 tap_ref = None
 source_ref = None
 SHUTDOWN_SIGNALS = {signal.SIGTERM, signal.SIGINT}
@@ -322,25 +347,29 @@ shutdown_write_fd = None
 
 def begin_processing():
     """
-    Atomically transition recording→processing AND allocate a fresh job_id under
-    the same lock. Splitting these into two separate locks would leave a window
-    in which an old worker could match the new "processing" state with its
-    pre-watchdog-reset token. Also captures the cycle's mode under the same
-    lock so the worker can route to dictate vs translate without re-reading
-    mutable globals.
-    Returns (job_id, mode), or (None, None) if state wasn't "recording".
+    End the recording and queue its job in one critical section: the slot is
+    free for the next take at once, and the job holds its place in the paste
+    order from the moment the take ends, before its audio is even saved.
+    Returns (job_id, mode), or (None, None) if nothing was recording.
     """
     global state, state_ts, current_job_id, current_hotkey, current_mode
     with state_lock:
         if state != "recording":
             return None, None
-        state = "processing"
+        state = "idle"
         state_ts = time.monotonic()
         current_job_id += 1
         mode = current_mode
         current_hotkey = None
         current_mode = None
+        _jobs[current_job_id] = Job(current_job_id, mode)
         return current_job_id, mode
+
+
+def _drop_job(job_id):
+    """Take a job out of the queue; False if something already voided it."""
+    with state_lock:
+        return _jobs.pop(job_id, None) is not None
 
 
 def shutdown_signal_loop():
@@ -377,68 +406,39 @@ def _install_shutdown_handling():
     ).start()
 
 
-def _claim_job_completion(job_id):
-    """
-    Transition processing→idle ONLY if this specific job is still the current one.
-    Prevents a stale worker (whose generation was bumped by a watchdog reset and
-    a new recording cycle) from clobbering the active job's state or pasting old
-    text into the user's current app.
-    """
-    global state, state_ts, current_hotkey, current_mode, current_wav_path
-    with state_lock:
-        if state == "processing" and current_job_id == job_id:
-            state = "idle"
-            state_ts = time.monotonic()
-            current_hotkey = None
-            current_mode = None
-            current_wav_path = None
-            return True
-        return False
-
-
 def _watchdog_tick():
     """
     Single watchdog pass. The hard recording limit is routed through the normal
     on_key_up path, which stops, atomically saves, and processes every captured
-    sample. Processing timeout cleanup stays under state_lock so a fresh
-    recording cannot start between the state reset and overlay cleanup.
+    sample. A take stuck in transcription is dropped from the queue, so the
+    takes behind it can paste; its audio stays in .pending for the retry loop.
     """
-    global state, state_ts, current_job_id, current_hotkey, current_mode
-    global current_wav_path
     finish_keycode = None
-    finish_reason = None
+    now = time.monotonic()
 
     with state_lock:
-        elapsed = time.monotonic() - state_ts
+        elapsed = now - state_ts
         if state == "recording" and elapsed > RECORDING_TIMEOUT_SEC:
             finish_keycode = current_hotkey
-            finish_reason = "hard recording limit"
+        stuck = [
+            job for job in _jobs.values()
+            if not job.done and now - job.started > PROCESSING_TIMEOUT_SEC
+        ]
+        for job in stuck:
+            del _jobs[job.id]
 
-        if state == "processing" and elapsed > PROCESSING_TIMEOUT_SEC:
-            pending = current_wav_path
-            log(
-                f"watchdog: stuck in processing for {elapsed:.0f}s, resetting; "
-                + (
-                    f"recording preserved in .pending: {pending.name}"
-                    if pending is not None
-                    else "no pending recording tracked"
-                )
-            )
-            state = "idle"
-            state_ts = time.monotonic()
-            current_job_id += 1
-            current_hotkey = None
-            current_mode = None
-            # Surface the failure instead of silently dropping the spinner;
-            # the background retry loop will re-transcribe the preserved WAV.
-            overlay.flash_error("Transcription timed out, saved for retry")
-            current_wav_path = None
+    for job in stuck:
+        log(
+            f"watchdog: take {job.id} stuck in transcription for "
+            f"{now - job.started:.0f}s, dropped from the queue; "
+            + (f"recording kept in .pending: {job.path.name}" if job.path else "no file yet")
+        )
+    if stuck:
+        overlay.flash_error("Timed out · saved")
+        _schedule_drain()
 
     if finish_keycode is not None:
-        log(
-            f"watchdog: {finish_reason} after {elapsed:.0f}s; "
-            "finalizing captured audio"
-        )
+        log(f"watchdog: hard recording limit after {elapsed:.0f}s; finalizing captured audio")
         # on_key_up owns the normal stop → atomic save → worker path. If the
         # real key-up raced this call, its ownership check makes this a no-op.
         on_key_up(finish_keycode)
@@ -474,9 +474,8 @@ def pending_retry_loop():
         time.sleep(PENDING_RETRY_POLL_SEC)
         try:
             with state_lock:
-                idle = state == "idle"
-                has_pending = current_wav_path is None
-            if not idle or not has_pending:
+                busy = state != "idle" or bool(_jobs)
+            if busy:
                 continue
             recover_pending_recordings()
         except Exception as e:
@@ -490,19 +489,44 @@ def copy_to_clipboard(text):
         raise RuntimeError("pasteboard rejected transcription")
 
 
+# A target app reads the clipboard when it handles ⌘V, which can be after the
+# next paste has already replaced it. Back-to-back pastes wait this long apart.
+PASTE_SETTLE_SEC = 0.3
+_last_paste_at = 0.0
+
+
+def _settle_clipboard():
+    """Wait until the last paste has had PASTE_SETTLE_SEC to be read."""
+    wait = PASTE_SETTLE_SEC - (time.monotonic() - _last_paste_at)
+    if wait > 0:
+        time.sleep(wait)
+
+
 def paste_text(text):
+    """
+    Copy, then ⌘V. False when the ⌘V was not posted; the text is on the
+    clipboard by then unless the copy itself raised.
+    """
+    global _last_paste_at
     try:
+        _settle_clipboard()
         copy_to_clipboard(text)
         if not CGPreflightPostEventAccess():
             log("paste blocked: Accessibility permission is not trusted")
             return False
         time.sleep(0.05)
+        # The drain checked the modifiers before it got here; a key pressed
+        # since (the next take, a stop tap) would turn this into ⌥⌘V.
+        if _modifiers_held():
+            log("paste skipped: a modifier went down just before it")
+            return False
 
         for press in (True, False):
             e = CGEventCreateKeyboardEvent(None, V_KEY, press)
             CGEventSetFlags(e, kCGEventFlagMaskCommand)
             CGEventPost(kCGHIDEventTap, e)
 
+        _last_paste_at = time.monotonic()
         return True
     except Exception as e:
         log(f"paste error: {e}")
@@ -723,7 +747,7 @@ def _with_retry(message, retry_in):
     """Append the scheduled retry, when there is one."""
     if retry_in is None:
         return message
-    return f"{message} — retrying in {retry_in}s"
+    return f"{message} · retry in {retry_in}s"
 
 
 def provider_wait_hint(error):
@@ -756,36 +780,34 @@ def error_notice(error, retry_in=None):
     user re-records something the app is about to deliver anyway.
     """
     if isinstance(error, NothingRecognizedError):
-        return "Nothing recognized"
+        return "No speech"
     text = str(error).strip()
     if not text:
-        return _with_retry("Transcription failed", retry_in)
+        return _with_retry("Failed", retry_in)
 
     hint = provider_wait_hint(error)
     if hint is not None:
         # The schedule already folded this hint in, so the countdown below
         # states it once rather than quoting two different numbers.
         return _with_retry("Rate limited", retry_in) if retry_in else (
-            f"Rate limited, try again in {hint}s"
+            f"Rate limited · {hint}s"
         )
     # Mistral reports a capacity shortage and a spent quota with the same
     # status, so the body decides the wording. They call for opposite
     # reactions: a capacity refusal clears on its own and the retry ladder is
     # already working on it, while a spent quota means waiting for a reset.
     if is_capacity_shortage(error):
-        return _with_retry("Provider busy", retry_in) if retry_in else (
-            "Provider busy, retrying"
-        )
+        return _with_retry("Mistral busy", retry_in)
     if "429" in text:
-        return _with_retry("Rate limited, try again shortly", retry_in)
+        return _with_retry("Rate limited", retry_in)
     if isinstance(error, ProviderUnavailableError):
-        return _with_retry("No connection to the transcription service", retry_in)
+        return _with_retry("No connection", retry_in)
     if "too large" in text.lower():
-        return _with_retry("Recording is too long to transcribe", retry_in)
+        return _with_retry("Too long", retry_in)
     if "api key" in text.lower():
-        return _with_retry("API key is missing or rejected", retry_in)
+        return _with_retry("API key rejected", retry_in)
     if "microphone" in text.lower():
-        return _with_retry("Microphone access is blocked in System Settings", retry_in)
+        return _with_retry("Mic blocked", retry_in)
 
     # Unrecognized: show the provider's own words rather than swallowing them.
     # The overlay collapses whitespace and truncates, so a long one is safe.
@@ -794,15 +816,15 @@ def error_notice(error, retry_in=None):
 
 def process_pending_recording(path, job_id, mode):
     """
-    Live worker spawned by on_key_up. job_id is the generation token captured
-    when the worker was scheduled; mode selects dictate vs translate.
+    Live worker spawned by on_key_up, one per take; several run at once. It
+    only transcribes and files the result on its job: pasting is
+    _drain_ready_jobs's, which keeps the takes in the order they were spoken.
     Recovery uses recover_pending_recordings instead — it has different rules
     around the clipboard.
     """
     text = None
     notice = None
     rejected = False
-    retry_in = None
     try:
         if mode == MODE_TRANSLATE:
             text = transcriber.transcribe_and_translate_sync(path)
@@ -817,45 +839,195 @@ def process_pending_recording(path, job_id, mode):
         rejected = True
     except TranscriptionError as e:
         log(f"transcription error {path.name}: {e}")
-        retry_in = _schedule_pending_retry(path, e)
-        notice = error_notice(e, retry_in=retry_in)
+        notice = error_notice(e, retry_in=_schedule_pending_retry(path, e))
     except Exception as e:
         log(f"processing error {path.name}: {e}")
-        retry_in = _schedule_pending_retry(path, e)
-        notice = error_notice(e, retry_in=retry_in)
+        notice = error_notice(e, retry_in=_schedule_pending_retry(path, e))
 
-    # Claim ownership of THIS job — exact job_id match. A bare state check
-    # would also accept a *newer* job's "processing" state and let a stale
-    # worker paste old text into whatever the user is doing now. The claim
-    # and the clipboard mutation share _clipboard_gate so the background
-    # recovery pass can never interleave its own clipboard write between
-    # this job's claim and its paste.
+    with state_lock:
+        job = _jobs.get(job_id)
+        if job is not None:
+            job.done = True
+            job.text = text
+            job.notice = notice
+            job.rejected = rejected
+    if job is None:
+        # Voided by a cancel, the watchdog or shutdown. The audio stays in
+        # .pending: the user called off the wait, not the words.
+        log(f"stale worker abandoned: {path.name}")
+        return
+    _drain_ready_jobs()
+
+
+DRAIN_RECHECK_SEC = 0.15
+# A modifier that reads as down this long after the take is ready, with no
+# recording going on, is taken to be stuck (a remapper, remote input, a key-up
+# lost across a screen lock). The text goes to the clipboard instead of
+# waiting behind it forever, and the queue behind it moves on.
+MODIFIER_HOLD_MAX_SEC = 4.0
+# Caps Lock is left out on purpose: it latches, and ⌘V works with it on.
+_HELD_MODIFIERS = (
+    kCGEventFlagMaskCommand | kCGEventFlagMaskAlternate
+    | kCGEventFlagMaskShift | kCGEventFlagMaskControl
+)
+# One recheck timer at a time, however many drains see the key held.
+_drain_recheck_armed = False
+# When a drain first found a done take held back by a modifier with nothing
+# recording; None otherwise. MODIFIER_HOLD_MAX_SEC counts from here, not from
+# when the take finished: a take that waited behind a long held recording
+# must still paste when that key comes up.
+_held_since = None
+
+
+def _modifiers_held():
+    """
+    True while any modifier is physically down. ⌘V posted then would merge
+    with it: right Option makes it ⌥⌘V, right Shift ⇧⌘V, and both happen
+    whenever a take finishes while the next one is held, hands-free is being
+    switched on, or a stop tap is in progress. The tap drains the queue as
+    soon as the last modifier comes up.
+    """
+    return bool(
+        CGEventSourceFlagsState(kCGEventSourceStateHIDSystemState) & _HELD_MODIFIERS
+    )
+
+
+def _drain_recheck():
+    global _drain_recheck_armed
+    with state_lock:
+        _drain_recheck_armed = False
+    _drain_ready_jobs()
+
+
+def _copy_only(text):
+    try:
+        copy_to_clipboard(text)
+        return True
+    except Exception as e:
+        log(f"clipboard error: {e}")
+        return False
+
+
+def _drain_ready_jobs():
+    """
+    Deliver every finished take at the head of the queue, in spoken order. A
+    take that finished early waits for the ones before it. Consecutive texts
+    go in as one paste, so the target app never sees two ⌘V in a row.
+
+    Everything from taking the jobs out of the queue to deleting their files
+    happens under _clipboard_gate, which is also what recovery takes before it
+    looks at the disk: it can never see a file whose job has just left _jobs.
+    """
+    global _drain_recheck_armed, _held_since
     with _clipboard_gate:
-        if not _claim_job_completion(job_id):
-            log(f"stale worker abandoned: {path.name}")
-            return
-
-        if notice:
-            overlay.flash_error(notice, token=job_id)
-            if rejected:
-                quarantine_path(path, "rejected by the provider")
-            return  # otherwise keep the file for retry
-
-        if text:
-            if paste_text(text):
-                log(f"pasted {len(text)} chars from {path.name}")
-                overlay.hide(token=job_id)
+        ready = []
+        # Settle before looking at the keys, so the look is as close to the
+        # ⌘V as it can be.
+        _settle_clipboard()
+        held = _modifiers_held()
+        rearm = False
+        overdue = False
+        with state_lock:
+            head = next(iter(_jobs.values()), None)
+            waiting = head is not None and head.done
+            if held and waiting and state != "recording":
+                now = time.monotonic()
+                if _held_since is None:
+                    _held_since = now
+                overdue = now - _held_since > MODIFIER_HOLD_MAX_SEC
             else:
-                overlay.flash_error("Could not paste into this app", token=job_id)
-                return  # keep file
-        else:
-            log(f"no speech detected in {path.name}")
-            overlay.hide(token=job_id)
+                _held_since = None
+            if not held or overdue:
+                _held_since = None
+                for job in list(_jobs.values()):
+                    if not job.done:
+                        break
+                    del _jobs[job.id]
+                    ready.append(job)
+            elif waiting and not _drain_recheck_armed:
+                # Look again shortly: the key-up that should release this
+                # paste can arrive before the system's own modifier state
+                # catches up, and a stuck key has to be noticed.
+                _drain_recheck_armed = rearm = True
+        if rearm:
+            try:
+                timer = threading.Timer(DRAIN_RECHECK_SEC, _drain_recheck)
+                timer.daemon = True
+                timer.start()
+            except Exception as e:
+                with state_lock:
+                    _drain_recheck_armed = False
+                log(f"drain recheck start error: {e}")
 
-        delete_pending_recording(path)
+        texts = [job for job in ready if job.text and not job.notice]
+        if texts:
+            combined = "".join(job.text for job in texts)
+            if not overdue and paste_text(combined):
+                log(f"pasted {len(combined)} chars from {len(texts)} take(s)")
+                delivered = True
+            elif _copy_only(combined):
+                # No ⌘V (a stuck modifier, or the app or the permission
+                # refused it), but the words are where ⌘V will find them.
+                log(f"copied {len(combined)} chars from {len(texts)} take(s); not pasted")
+                overlay.flash_notice("Copied · ⌘V")
+                delivered = True
+            else:
+                # The files stay in .pending; the retry loop puts the text
+                # in the clipboard later.
+                overlay.flash_error("Paste failed · saved")
+                delivered = False
+            if delivered:
+                for job in texts:
+                    delete_pending_recording(job.path)
+
+        for job in ready:
+            if job.notice:
+                overlay.flash_error(job.notice)
+                if job.rejected:
+                    quarantine_path(job.path, "rejected by the provider")
+                # otherwise the file stays for the retry loop
+            elif not job.text:
+                log(f"no speech detected in {job.path.name}")
+                delete_pending_recording(job.path)
+
+        _refresh_overlay()
+
+
+def _schedule_drain():
+    """Drain off the calling thread: the event tap must never wait on a paste."""
+    try:
+        threading.Thread(target=_drain_ready_jobs, daemon=True).start()
+    except Exception as e:
+        log(f"drain start error: {e}")
+
+
+_overlay_lock = threading.Lock()
+
+
+def _refresh_overlay():
+    """
+    Show what is going on right now: the recording, else the transcription
+    queue, else nothing. Read and posted under one lock, so two threads can
+    never leave the pill showing the older of two snapshots.
+    """
+    with _overlay_lock:
+        with state_lock:
+            recording = state == "recording"
+            label = HANDS_FREE_LABEL if current_hands_free else MODE_LABELS.get(current_mode)
+            queued = len(_jobs)
+            head = next(iter(_jobs.values()), None)
+        if recording:
+            overlay.show("recording", label=label, queued=queued)
+        elif head is not None:
+            overlay.show("loading", label=MODE_LABELS.get(head.mode), queued=queued)
+        else:
+            overlay.hide()
 
 
 RECOVERY_SEPARATOR = "\n\n---\n\n"
+# Text recovery already paid for but could not hand over because a take was
+# live, by file name. The next pass delivers it without a second request.
+_recovered_text = {}
 
 
 def recover_pending_recordings():
@@ -888,18 +1060,25 @@ def recover_pending_recordings():
             except OSError as e:
                 log(f"remove partial write error {tmp.name}: {e}")
 
-    # A live dictation's WAV is owned by its worker. A cycle can start in the
-    # gap between this pass deciding to run and the glob below, and both
-    # transcribing the same file would spend the quota twice and let recovery
-    # delete a file the worker still needs.
-    with state_lock:
-        live = current_wav_path
-    paths = sorted(
-        path
-        for pending_dir in existing_dirs
-        for path in pending_dir.glob("*.wav")
-        if path != live
-    )
+    # A live take's WAV is its worker's. A take can end in the gap between
+    # this pass deciding to run and the glob, and both transcribing the same
+    # file would spend the quota twice and paste the text twice. So: glob
+    # first, then drop whatever a job owns. The drain holds _clipboard_gate
+    # from taking a job out of _jobs until its file is gone, so under the gate
+    # a file is never between owners; and a take still being saved has no
+    # path yet, so its file could be in the glob unclaimed: wait for it.
+    with _clipboard_gate:
+        found = [
+            path
+            for pending_dir in existing_dirs
+            for path in pending_dir.glob("*.wav")
+        ]
+        with state_lock:
+            saving = any(job.path is None for job in _jobs.values())
+            live = {job.path for job in _jobs.values()}
+    if saving:
+        return
+    paths = sorted(path for path in found if path not in live)
     if not paths:
         return
 
@@ -930,6 +1109,9 @@ def recover_pending_recordings():
             quarantine_path(path, "corrupt WAV header")
             continue
         mode = parse_pending_mode(path)
+        if path.name in _recovered_text:
+            recovered.append((path, _recovered_text[path.name]))
+            continue
         try:
             if mode == MODE_TRANSLATE:
                 text = transcriber.transcribe_and_translate_sync(path)
@@ -982,11 +1164,23 @@ def recover_pending_recordings():
     if non_empty:
         combined = RECOVERY_SEPARATOR.join(t for _, t in non_empty)
         try:
-            # The gate covers the clipboard write only. A live worker holds it
-            # across its own claim and paste, so this can never land between
-            # the two — and it no longer blocks that paste behind the network.
+            # The gate covers the clipboard write only. The drain holds it
+            # across its own paste, so this can never land in the middle of
+            # one — and it never blocks that paste behind the network.
             with _clipboard_gate:
-                copy_to_clipboard(combined)
+                with state_lock:
+                    live = state != "idle" or bool(_jobs)
+                if not live:
+                    _settle_clipboard()
+                    copy_to_clipboard(combined)
+            if live:
+                # A take started while this pass was transcribing. Its paste
+                # would replace the recovered text a moment after it landed,
+                # and the files would be gone: keep both, deliver next pass.
+                for path, text in recovered:
+                    _recovered_text[path.name] = text
+                log(f"recovery deferred: a take is live; {len(recovered)} kept for the next pass")
+                return
             log(f"recovered {len(non_empty)} dictation(s) ({len(combined)} chars total) to clipboard")
         except Exception as e:
             log(f"recovery clipboard error: {e}")
@@ -999,16 +1193,15 @@ def recover_pending_recordings():
         # fails to draw must not strand the files it came from.
         try:
             overlay.flash_notice(
-                f"Recovered {len(combined)} chars to clipboard"
-                if len(non_empty) == 1
-                else f"Recovered {len(non_empty)} recordings "
-                     f"({len(combined)} chars) to clipboard"
+                "Copied · ⌘V" if len(non_empty) == 1
+                else f"{len(non_empty)} copied · ⌘V"
             )
         except Exception as e:
             log(f"recovery notice error: {e}")
 
     # Delete files only after a successful clipboard write (or on filtered-empty results)
     for path, _ in recovered:
+        _recovered_text.pop(path.name, None)
         delete_pending_recording(path)
 
 
@@ -1036,54 +1229,61 @@ def _all_pending_names(min_age_sec=0.0):
     return names
 
 
-def cancel_everything():
+def cancel_everything(min_age=0.0):
     """
     Stop whatever is in flight and hold the queue, without losing audio.
 
-    A state-machine primitive, like the watchdog's reset: it bumps
-    current_job_id so an in-flight worker's claim fails and it aborts
-    silently instead of pasting into whatever the user is doing next. A
-    recording still being captured is finalized to disk rather than dropped —
-    the user asked to stop waiting, not to discard what they said.
+    Voids every queued job at least min_age old, so a late worker drops its
+    result instead of pasting into whatever the user is doing next. Younger
+    takes carry on and paste: the cancel tap passes CANCEL_GRACE_SEC, and a
+    take voided before its file is old enough to be held would be picked up
+    by the retry loop while its worker still runs. A recording still being
+    captured is finalized to disk rather than dropped — the user asked to stop
+    waiting, not to discard what they said.
 
     Returns (what_was_stopped, recordings_held, newly_held). The last one is
     what decides whether there is anything to tell the user: a tap that held
     nothing new changed nothing, and this key is also how capitals get typed.
     """
-    global state, state_ts, current_job_id, current_hotkey, current_mode
-    global current_wav_path
-
     stopped = None
     finish_keycode = None
+    now = time.monotonic()
     with state_lock:
+        newest = current_job_id
         if state == "recording":
             stopped = "recording"
             finish_keycode = current_hotkey
-        elif state == "processing":
+        # A take that is already done is only waiting for the stuck one
+        # ahead of it: it stays, and pastes once that one is out of the way.
+        stale = [
+            job for job in _jobs.values()
+            if not job.done and now - job.started >= min_age
+        ]
+        for job in stale:
+            del _jobs[job.id]
+        if stale and stopped is None:
             stopped = "processing"
-            current_job_id += 1
-            state = "idle"
-            state_ts = time.monotonic()
-            current_hotkey = None
-            current_mode = None
-            current_wav_path = None
+        # Held by name: a file written a moment after its job started can be
+        # younger than the grace while the job is past it, and an unheld file
+        # would go straight back to the retry loop.
+        voided = [job.path.name for job in stale if job.path is not None]
 
     if finish_keycode is not None:
         # Outside the lock, like the watchdog's hard-limit branch: on_key_up
         # owns stop → atomic save → worker. Run it so the audio reaches disk,
-        # then void the job it just started — the recording belongs to the
-        # user, the transcription is what they asked to call off.
+        # then void its job — the recording belongs to the user, the
+        # transcription is what they asked to call off.
         on_key_up(finish_keycode)
         with state_lock:
-            current_job_id += 1
-            if state == "processing":
-                state = "idle"
-                state_ts = time.monotonic()
-                current_hotkey = None
-                current_mode = None
-                current_wav_path = None
+            for job_id in [i for i in _jobs if i > newest]:
+                del _jobs[job_id]
 
-    held = _all_pending_names(min_age_sec=CANCEL_GRACE_SEC)
+    if stopped is not None:
+        _refresh_overlay()
+    if stale:
+        # Done takes that waited behind a voided one can go now.
+        _schedule_drain()
+    held = sorted(set(_all_pending_names(min_age_sec=CANCEL_GRACE_SEC)) | set(voided))
     with _pending_failures_lock:
         newly_held = [n for n in held if n not in _pending_cancelled]
         _pending_cancelled.update(held)
@@ -1110,9 +1310,10 @@ def _begin_recording(keycode, mode, hands_free=False):
     can see the new "recording" state but the wrong (stale) hotkey/mode.
     Returns True on success.
     """
-    global state, state_ts, current_hotkey, current_mode
-    global current_wav_path, current_hands_free
+    global state, state_ts, current_hotkey, current_mode, current_hands_free
     with state_lock:
+        # Only the recording slot matters: earlier takes may still be
+        # transcribing, and they paste in order behind this one.
         if state != "idle":
             return False
         state = "recording"
@@ -1120,7 +1321,6 @@ def _begin_recording(keycode, mode, hands_free=False):
         current_hotkey = keycode
         current_mode = mode
         current_hands_free = hands_free
-        current_wav_path = None
         return True
 
 
@@ -1138,6 +1338,8 @@ def _abandon_recording_cycle():
             state_ts = time.monotonic()
         current_hotkey = None
         current_mode = None
+    # A take that finished while this key was held waited for it.
+    _schedule_drain()
 
 
 def on_key_down(keycode, mode, hands_free=False):
@@ -1148,19 +1350,16 @@ def on_key_down(keycode, mode, hands_free=False):
             "recording blocked: Microphone permission is denied or restricted"
         )
         _abandon_recording_cycle()
-        overlay.flash_error("Microphone access is blocked in System Settings")
+        overlay.flash_error("Mic blocked")
         return
     try:
         recorder.start()
         log(f"recording started: mode={mode}{'; hands-free' if hands_free else ''}")
-        overlay.show(
-            "recording",
-            label=HANDS_FREE_LABEL if hands_free else MODE_LABELS.get(mode),
-        )
+        _refresh_overlay()
     except Exception as e:
         log(f"recorder.start error: {e}")
         _abandon_recording_cycle()
-        overlay.flash_error("Could not start recording")
+        overlay.flash_error("Mic unavailable")
 
 
 _last_cancel_tap = 0.0
@@ -1169,7 +1368,7 @@ _cancel_tap_lock = threading.Lock()
 
 def on_cancel_tap():
     """
-    Right Control. One tap stops everything and holds the queue; a second tap
+    Caps Lock. One tap stops everything stuck and holds it; a second tap
     inside CANCEL_DOUBLE_TAP_SEC releases it and tries again straight away, so
     the same key both calls off a stuck transcription and restarts it.
     """
@@ -1177,15 +1376,15 @@ def on_cancel_tap():
     now = time.monotonic()
 
     with state_lock:
-        busy = state
-        elapsed = now - state_ts
+        recording = state == "recording"
+        oldest = min((job.started for job in _jobs.values()), default=None)
 
     # This key is also how people type capitals, so every path that has
     # nothing to do returns in silence — no pill, no log line. Only a tap that
     # actually changes something is allowed to say so.
-    if busy == "recording":
+    if recording:
         return
-    if busy == "processing" and elapsed < CANCEL_GRACE_SEC:
+    if oldest is not None and now - oldest < CANCEL_GRACE_SEC:
         return
 
     with _pending_failures_lock:
@@ -1200,18 +1399,14 @@ def on_cancel_tap():
     if double:
         released = resume_everything()
         log(f"resume requested: {released} recording(s) queued now")
-        overlay.flash_notice(f"Retrying {released} recording(s) now", sound=False)
+        overlay.flash_notice(f"Retrying {released}", sound=False)
         return
 
-    stopped, held, newly_held = cancel_everything()
+    stopped, held, newly_held = cancel_everything(min_age=CANCEL_GRACE_SEC)
     if stopped is None and newly_held == 0:
         return
     log(f"cancel requested: stopped={stopped or 'nothing'}; {held} held")
-    overlay.flash_notice(
-        f"Cancelled — {held} recording(s) kept, double-tap to retry" if held
-        else "Cancelled",
-        sound=False,
-    )
+    overlay.flash_notice(f"Cancelled · {held} kept" if held else "Cancelled", sound=False)
 
 
 def on_key_up(keycode):
@@ -1221,46 +1416,65 @@ def on_key_up(keycode):
         if current_hotkey != keycode:
             return
 
-    # Atomically claim the recording→processing transition, capture the mode,
-    # and allocate a fresh job_id. An old worker's claim must not match this
-    # id even in the tiny window between state change and worker spawn.
-    job_id, mode = begin_processing()
-    if job_id is None:
-        return
-
     with _save_gate:
+        # Stop the recorder BEFORE the slot is freed. Once it is free a
+        # key-down can start the next take, and recorder.start() resets the
+        # buffer this stop is about to return: the watchdog stopping a long
+        # take would get the new, empty one. The gate makes a second stopper
+        # (watchdog vs. real key-up) wait, then find nothing to stop.
+        with state_lock:
+            if state != "recording" or current_hotkey != keycode:
+                return
         try:
-            audio = recorder.stop()
-            log(
-                f"recording stopped: {len(audio)} samples; mode={mode}; "
-                f"loudest frame {loudest_frame_rms(audio):.4f}"
-            )
+            audio, stop_error = recorder.stop(), None
         except Exception as e:
-            log(f"recorder.stop error: {e}")
-            if _claim_job_completion(job_id):
-                overlay.flash_error("Recording failed")
+            audio, stop_error = None, e
+
+        # Free the recording slot and queue the job in one step: the next
+        # take can start right away, and this one already holds its place in
+        # the paste order.
+        job_id, mode = begin_processing()
+        if job_id is None:
             return
+
+        if stop_error is not None:
+            log(f"recorder.stop error: {stop_error}")
+            if _drop_job(job_id):
+                overlay.flash_error("Recording failed")
+            _schedule_drain()
+            return
+        log(
+            f"recording stopped: {len(audio)} samples; mode={mode}; "
+            f"loudest frame {loudest_frame_rms(audio):.4f}"
+        )
 
         if len(audio) < MIN_AUDIO_SAMPLES:
             log(
                 f"recording ignored: {len(audio)} samples is below "
                 f"{MIN_AUDIO_SAMPLES}-sample minimum"
             )
-            overlay.hide()
-            _claim_job_completion(job_id)
+            _drop_job(job_id)
+            _schedule_drain()
             return
 
         try:
             wav_path = save_recording_with_fallback(audio, mode)
         except Exception as e:
             log(f"save pending recording error: {e}")
-            if _claim_job_completion(job_id):
-                overlay.flash_error("Could not save the recording")
+            if _drop_job(job_id):
+                overlay.flash_error("Not saved")
+            _schedule_drain()
             return
 
-    overlay.show("loading", label=MODE_LABELS.get(mode), token=job_id)
-    global current_wav_path
-    current_wav_path = wav_path
+        with state_lock:
+            job = _jobs.get(job_id)
+            if job is not None:
+                job.path = wav_path
+    if job is None:
+        # Voided while saving (cancel, shutdown). The file is on disk, so the
+        # retry loop owns it now.
+        return
+
     try:
         threading.Thread(
             target=process_pending_recording,
@@ -1269,9 +1483,10 @@ def on_key_up(keycode):
         ).start()
     except Exception as e:
         log(f"processing worker start error {wav_path.name}: {e}")
-        current_wav_path = None
-        if _claim_job_completion(job_id):
-            overlay.flash_error("Could not start transcription")
+        if _drop_job(job_id):
+            overlay.flash_error("Will retry")
+    # Takes that finished while this key was held were waiting for it.
+    _schedule_drain()
 
 
 def _other_input_since(started):
@@ -1364,7 +1579,7 @@ def on_dictate_key(keycode, pressed, other_held):
         _hands_free_started_at = now
         _hands_free_stop_pressed_at = None
         log("recording switched to hands-free")
-        overlay.show("recording", label=HANDS_FREE_LABEL)
+        _refresh_overlay()
         return
 
     if not pressed:
@@ -1406,6 +1621,15 @@ def tap_callback(proxy, event_type, event, refcon):
             # SECOND press and make the double tap unreachable. One event is
             # already one press, so fire on all of them.
             on_cancel_tap()
+
+        # Any modifier, ours or not, can hold back a paste (_modifiers_held).
+        # The event that lifts the last one releases it.
+        if not CGEventGetFlags(event) & _HELD_MODIFIERS:
+            with state_lock:
+                head = next(iter(_jobs.values()), None)
+                waiting = head is not None and head.done
+            if waiting:
+                _schedule_drain()
     except Exception as e:
         log(f"tap_callback error: {e}")
 

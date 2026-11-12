@@ -39,18 +39,18 @@ class _Overlay:
     def __init__(self):
         self.shown = []
 
-    def show(self, mode, label=None, token=None):
+    def show(self, mode, label=None, queued=0, **_):
         self.shown.append((mode, label))
 
-    def hide(self, token=None):
+    def hide(self, **_):
         pass
 
-    def flash_error(self, message=None, duration=None, token=None):
+    def flash_error(self, message=None, duration=None, **_):
         self.shown.append(("error", message))
 
 
 class _Thread:
-    def __init__(self, *, target, args, daemon):
+    def __init__(self, *, target, args=(), daemon):
         pass
 
     def start(self):
@@ -89,7 +89,6 @@ def rig(monkeypatch, tmp_path):
         "current_mode": None,
         "current_hands_free": False,
         "current_job_id": 0,
-        "current_wav_path": None,
         "_hands_free_started_at": None,
         "_hands_free_stop_pressed_at": None,
     }.items():
@@ -140,7 +139,7 @@ def test_holding_either_key_dictates(rig, key):
     rig.release(key, after=3.0)
 
     assert rig.saved == [48000]
-    assert main.state == "processing"
+    assert main.state == "idle" and len(main._jobs) == 1
     assert ("recording", main.HANDS_FREE_LABEL) not in rig.overlay.shown
 
 
@@ -165,7 +164,7 @@ def test_adding_the_other_key_mid_dictation_keeps_the_audio(rig, held, added):
     assert rig.overlay.shown[-1] == ("recording", main.HANDS_FREE_LABEL)
 
     rig.tap(held, after=10.0)
-    assert main.state == "processing"
+    assert main.state == "idle" and len(main._jobs) == 1
     assert rig.saved[0] >= 14 * 16000
 
 
@@ -176,7 +175,7 @@ def test_a_tap_of_either_key_stops_it(rig, first, stop):
     rig.combo(first)
     rig.tap(stop, after=30.0)
 
-    assert main.state == "processing"
+    assert main.state == "idle" and len(main._jobs) == 1
     assert len(rig.saved) == 1
     assert rig.saved[0] >= 30 * 16000
 
@@ -185,7 +184,7 @@ def test_both_keys_again_also_stop_it(rig):
     rig.combo("opt")
     rig.combo("cmd", after=10.0)
 
-    assert main.state == "processing"
+    assert main.state == "idle" and len(main._jobs) == 1
     assert len(rig.saved) == 1
 
 
@@ -213,19 +212,20 @@ def test_either_key_used_as_a_shortcut_does_not_stop_it(rig, key):
     assert rig.saved == []
 
     rig.tap(key, after=5.0)
-    assert main.state == "processing"
+    assert main.state == "idle" and len(main._jobs) == 1
     assert len(rig.saved) == 1
 
 
 def test_a_plain_hold_after_hands_free_is_not_hands_free(rig):
     rig.combo()
     rig.tap(after=5.0)
-    main._claim_job_completion(main.current_job_id)
 
+    # No waiting for the first take: the next one starts while it transcribes.
     rig.press("opt", after=1.0)
+    assert main.state == "recording"
     assert main.current_hands_free is False
     rig.release("opt", after=2.0)
-    assert main.state == "processing"
+    assert main.state == "idle" and len(main._jobs) == 2
 
 
 @pytest.mark.parametrize("keycode, flags, expected", [

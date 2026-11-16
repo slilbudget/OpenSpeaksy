@@ -246,3 +246,10 @@ def test_a_message_over_a_recording_is_kept_short(monkeypatch):
     ov.show("recording")
     ov.flash_error("No connection · retry in 10s, and a long tail of words here")
     assert delays == [o.RECORDING_FLASH_MAX_SEC]
+
+
+def test_the_pill_can_show_over_full_screen_apps():
+    """A full-screen app is its own Space; only FullScreenAuxiliary lets the
+    pill appear there, so recording looked off in exactly those windows."""
+    assert o.PANEL_BEHAVIOR & o.NSWindowCollectionBehaviorFullScreenAuxiliary
+    assert o.PANEL_BEHAVIOR & o.NSWindowCollectionBehaviorCanJoinAllSpaces

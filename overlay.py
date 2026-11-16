@@ -13,6 +13,9 @@ from AppKit import (
     NSWindowStyleMaskBorderless, NSBackingStoreBuffered,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+    NSWindowStyleMaskNonactivatingPanel,
     NSAnimationContext,
     NSInsetRect, NSViewLayerContentsRedrawDuringViewResize,
     NSSound,
@@ -53,6 +56,15 @@ ERROR_PILL_MAX_H = (
 )
 PANEL_W = ERROR_MAX_W + 2 * PAD
 PANEL_H = max(H + PAD + LABEL_PAD, math.ceil(ERROR_PILL_MAX_H) + 2 * PAD)
+
+# Above every app window, on every Space, full-screen ones included.
+PANEL_LEVEL = 1000  # NSScreenSaverWindowLevel
+PANEL_BEHAVIOR = (
+    NSWindowCollectionBehaviorCanJoinAllSpaces
+    | NSWindowCollectionBehaviorStationary
+    | NSWindowCollectionBehaviorFullScreenAuxiliary
+    | NSWindowCollectionBehaviorIgnoresCycle
+)
 
 # Animation durations (seconds). Calm ease, no overshoot.
 EXPAND_IN = 0.32
@@ -533,15 +545,17 @@ class Overlay:
         origin = self._panel_origin()
         panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(origin.x, origin.y, PANEL_W, PANEL_H),
-            NSWindowStyleMaskBorderless,
+            # Non-activating: a panel from a background app that never takes
+            # focus, which is what lets it float over other apps' windows.
+            NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel,
             NSBackingStoreBuffered,
             False,
         )
-        panel.setLevel_(1000)
-        panel.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorStationary
-        )
+        panel.setLevel_(PANEL_LEVEL)
+        # Every Space, including the one a full-screen app gets to itself:
+        # without FullScreenAuxiliary the pill shows over ordinary windows
+        # and vanishes over a full-screen one.
+        panel.setCollectionBehavior_(PANEL_BEHAVIOR)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(CLEAR)
         panel.setHasShadow_(False)
@@ -564,6 +578,9 @@ class Overlay:
         self._gen += 1
 
         self._panel.setFrameOrigin_(self._panel_origin())
+        # Back on top on every show: since the last one the user may have
+        # switched Spaces or another app may have raised a window this high.
+        self._panel.orderFrontRegardless()
         self._view.setLabel_(label)
         self._view.setMessage_(message)
         self._view.setQueued_(queued)

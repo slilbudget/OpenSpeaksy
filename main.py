@@ -18,6 +18,7 @@ from Quartz import (
     CGEventGetIntegerValueField, CGEventGetFlags,
     CGEventCreateKeyboardEvent, CGEventSetFlags, CGEventPost,
     CGPreflightListenEventAccess, CGPreflightPostEventAccess,
+    CGRequestListenEventAccess, CGRequestPostEventAccess,
     CGEventMaskBit, CFMachPortCreateRunLoopSource,
     kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionListenOnly,
     kCGEventFlagsChanged, kCGKeyboardEventKeycode,
@@ -515,6 +516,51 @@ def _settle_clipboard():
         time.sleep(wait)
 
 
+def _load_tcc_functions():
+    """
+    The live permission checks and requests, from the system frameworks:
+    AXIsProcessTrusted(WithOptions) (Accessibility) and IOHIDCheckAccess /
+    IOHIDRequestAccess (Input Monitoring). CGPreflight*Access can keep
+    reporting what the process had at launch, so a grant made while it runs
+    would never be seen. Missing functions are simply left out.
+    """
+    found = {}
+    for path, functions in (
+        ("/System/Library/Frameworks/ApplicationServices.framework", [
+            ("AXIsProcessTrusted", b"Z"),
+            ("AXIsProcessTrustedWithOptions", b"Z@"),
+        ]),
+        ("/System/Library/Frameworks/IOKit.framework", [
+            ("IOHIDCheckAccess", b"II"),
+            ("IOHIDRequestAccess", b"ZI"),
+        ]),
+    ):
+        try:
+            objc.loadBundleFunctions(NSBundle.bundleWithPath_(path), found, functions)
+        except Exception as e:
+            log(f"permission API unavailable in {path}: {e}")
+    return found
+
+
+_tcc = _load_tcc_functions()
+IOHID_LISTEN_EVENT = 1        # kIOHIDRequestTypeListenEvent
+IOHID_ACCESS_GRANTED = 0      # kIOHIDAccessTypeGranted
+
+
+def _paste_allowed():
+    """Whether macOS lets this process post the ⌘V (Accessibility), live."""
+    trusted = _tcc.get("AXIsProcessTrusted")
+    return bool(CGPreflightPostEventAccess()) or bool(trusted and trusted())
+
+
+def _listen_allowed():
+    """Whether the hotkey tap may see modifier keys (Input Monitoring), live."""
+    check = _tcc.get("IOHIDCheckAccess")
+    if check and check(IOHID_LISTEN_EVENT) == IOHID_ACCESS_GRANTED:
+        return True
+    return bool(CGPreflightListenEventAccess())
+
+
 def paste_text(text):
     """
     Copy, then ⌘V. False when the ⌘V was not posted; the text is on the
@@ -524,7 +570,7 @@ def paste_text(text):
     try:
         _settle_clipboard()
         copy_to_clipboard(text)
-        if not CGPreflightPostEventAccess():
+        if not _paste_allowed():
             log("paste blocked: Accessibility permission is not trusted")
             return False
         time.sleep(0.05)
@@ -994,7 +1040,10 @@ def _drain_ready_jobs():
                 # No ⌘V (a stuck modifier, or the app or the permission
                 # refused it), but the words are where ⌘V will find them.
                 log(f"copied {len(combined)} chars from {len(texts)} take(s); not pasted")
-                overlay.flash_notice("Copied · ⌘V")
+                # Without Accessibility every take ends here: say what fixes it.
+                overlay.flash_notice(
+                    "Copied · ⌘V" if _paste_allowed() else "Copied · allow Accessibility"
+                )
                 delivered = True
             else:
                 # The files stay in .pending; the retry loop puts the text
@@ -1656,13 +1705,78 @@ def tap_callback(proxy, event_type, event, refcon):
     return event
 
 
+PERMISSION_POLL_SEC = 2
+
+
+def request_permissions():
+    """
+    Ask macOS for the two permissions the hotkeys and the paste need, and log
+    where they stand.
+
+    Asking is what puts the right entry in System Settings: the process that
+    runs is Homebrew's Python (a versioned path inside its Cellar, shown as
+    "Python"), not the venv's python symlink, so a user adding the venv path
+    by hand grants a binary that never runs, and the paste stays off. Asking
+    adds the real one; the user only turns it on.
+
+    Returns whether posting the ⌘V is allowed.
+    """
+    listen = _listen_allowed()
+    post = _paste_allowed()
+    log(f"input monitoring trusted: {listen}; post events trusted: {post}")
+    if not listen:
+        # IOHIDRequestAccess is what Apple recommends to get the Input
+        # Monitoring entry listed; the CG call is the older route.
+        request = _tcc.get("IOHIDRequestAccess")
+        if request:
+            request(IOHID_LISTEN_EVENT)
+        else:
+            CGRequestListenEventAccess()
+        log(
+            "requested Input Monitoring: turn on Python in System Settings > "
+            "Privacy & Security > Input Monitoring"
+        )
+    if not post:
+        # The prompt option adds the Accessibility entry and offers to open
+        # System Settings; the CG call is the fallback.
+        prompt = _tcc.get("AXIsProcessTrustedWithOptions")
+        if prompt:
+            prompt({"AXTrustedCheckOptionPrompt": True})
+        else:
+            CGRequestPostEventAccess()
+        log(
+            "requested Accessibility (on the newest macOS: Device Control and "
+            "Data Access): turn on Python in System Settings > Privacy & "
+            "Security; until then text is copied, not pasted"
+        )
+    return post
+
+
+def permission_watch_loop():
+    """
+    Restart once Accessibility is granted while running. A grant that lands
+    after start is not reliably honoured by a process that was refused at
+    start (Apple: "when you grant access via System Settings, it offers to
+    relaunch the app"), and that is how a fresh install ends up copying
+    instead of pasting. _paste_allowed reads the live AX state, so the grant
+    is seen here even when the CG preflight still reports the launch state. Waits for an idle moment, so no take is cut short; launchd starts
+    the app again within seconds (a nonzero exit, see the plist's KeepAlive).
+    """
+    while True:
+        time.sleep(PERMISSION_POLL_SEC)
+        if not _paste_allowed():
+            continue
+        with state_lock:
+            busy = state != "idle" or bool(_jobs)
+        if busy:
+            continue
+        log("Accessibility granted; restarting to pick it up")
+        os._exit(3)
+
+
 def run_event_tap():
     global tap_ref, source_ref
 
-    log(
-        f"input monitoring trusted: {bool(CGPreflightListenEventAccess())}; "
-        f"post events trusted: {bool(CGPreflightPostEventAccess())}"
-    )
     tap_ref = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
@@ -1750,6 +1864,9 @@ def main():
     # cannot race the recovery clipboard write.
     recover_pending_recordings()
 
+    if not request_permissions():
+        threading.Thread(target=permission_watch_loop, daemon=True).start()
+        overlay.flash_notice("Allow Accessibility to paste", sound=False)
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=pending_retry_loop, daemon=True).start()
     threading.Thread(target=run_event_tap, daemon=True).start()

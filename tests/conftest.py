@@ -32,6 +32,7 @@ def _no_held_keys(monkeypatch):
     import main
 
     monkeypatch.setattr(main, "_modifiers_held", lambda: False)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: True)
     monkeypatch.setattr(main, "PASTE_SETTLE_SEC", 0.0)
 
 

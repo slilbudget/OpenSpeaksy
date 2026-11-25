@@ -4,7 +4,7 @@
 
 # OpenSpeaksy
 
-Open-source speech-to-text for macOS, built on [Mistral](https://mistral.ai). Free, with your own API key.
+Open-source speech-to-text for macOS, built on [Mistral](https://mistral.ai), with your own API key.
 
 [![CI](https://github.com/slilbudget/OpenSpeaksy/actions/workflows/ci.yml/badge.svg)](https://github.com/slilbudget/OpenSpeaksy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -24,7 +24,7 @@ Start the next take while the last one is still transcribing: they paste in the 
 
 ## Install
 
-Requires macOS 13+ and a [Mistral API key](https://console.mistral.ai/api-keys) (free plan, no card).
+Requires macOS 13+ and a [Mistral API key](https://console.mistral.ai/api-keys) with **API pay-as-you-go** on (Admin → Subscription). Without it Mistral refuses the default model, Transcribe 3, and every take falls back to the older `voxtral-mini-2602`. Transcribe 3 costs about $0.004 per minute of audio.
 
 **With an AI agent** (Claude Code, Codex, Cursor). Paste:
 
@@ -40,7 +40,7 @@ git clone https://github.com/slilbudget/OpenSpeaksy.git ~/OpenSpeaksy
 cd ~/OpenSpeaksy && ./scripts/install.sh
 ```
 
-Then, either way: **System Settings → Privacy & Security** → allow `~/OpenSpeaksy/venv/bin/python` under **Input Monitoring** and **Accessibility**, and allow the **Microphone** prompt on the first recording.
+Then, either way: **System Settings → Privacy & Security** → in **Input Monitoring** and **Accessibility** (on the newest macOS: *Device Control and Data Access*), turn on **Python** (the app has already added it; it may read python3.x; if there are two, both). Allow the **Microphone** prompt on the first recording. `./scripts/doctor.sh` checks it all and says what's missing.
 
 ## Settings
 
@@ -66,17 +66,18 @@ launchctl load ~/Library/LaunchAgents/com.openspeaksy.plist
 
 ## Privacy
 
-Audio goes only to Mistral, under your key. No telemetry; transcripts and the key are never logged. On Mistral's free plan, turn off training: Admin → **Privacy** → **Anonymous improvement data**.
+Audio goes only to Mistral, under your key. No telemetry; transcripts and the key are never logged. To keep your audio out of Mistral's training, turn off Admin → **Privacy** → **Anonymous improvement data**.
 
 ## Troubleshooting
 
 | Problem | Fix |
 |:---|:---|
-| Nothing happens | Allow **Input Monitoring** |
-| Doesn't paste | Allow **Accessibility** |
+| Nothing happens | **Input Monitoring** → Python on |
+| Text is only copied (pill: "Copied · allow Accessibility") | **Accessibility** → Python on |
+| Stopped after `brew upgrade` | Re-run `./scripts/install.sh`, switch the new Python on |
 | Pill says **Mic blocked** | Allow **Microphone** |
 | Caps Lock types capitals | Keyboard → Modifier Keys → Caps Lock → **No Action** |
-| Anything else | `tail -f ~/Library/Logs/com.openspeaksy/main.log` |
+| Anything else | `./scripts/doctor.sh`, then `tail -f ~/Library/Logs/com.openspeaksy/main.log` |
 
 ## Uninstall
 

@@ -272,7 +272,7 @@ def test_back_to_back_pastes_leave_the_app_time_to_read_the_clipboard(monkeypatc
     monkeypatch.setattr(main, "PASTE_SETTLE_SEC", 0.3)
     monkeypatch.setattr(main.time, "sleep", slept.append)
     monkeypatch.setattr(main, "copy_to_clipboard", lambda text: None)
-    monkeypatch.setattr(main, "CGPreflightPostEventAccess", lambda: False)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: False)
     main._last_paste_at = main.time.monotonic()
 
     main.paste_text("x")
@@ -582,7 +582,7 @@ def test_a_key_pressed_during_the_paste_turns_it_into_a_copy(monkeypatch):
     """The drain looked at the keys a moment before; ⌘V must look again."""
     posted, copied = [], []
     monkeypatch.setattr(main, "copy_to_clipboard", copied.append)
-    monkeypatch.setattr(main, "CGPreflightPostEventAccess", lambda: True)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: True)
     monkeypatch.setattr(main, "CGEventPost", lambda *a: posted.append(a))
     monkeypatch.setattr(main.time, "sleep", lambda s: None)
     monkeypatch.setattr(main, "_modifiers_held", lambda: True)
@@ -652,3 +652,81 @@ def test_a_long_take_gets_longer_before_the_watchdog_drops_it(q, tmp_path):
     assert main._take_timeout(main._jobs[1]) < main.TAKE_TIMEOUT_SEC + 1
     assert main._take_timeout(main._jobs[2]) >= main.TAKE_TIMEOUT_SEC + 20 * main.TAKE_TIMEOUT_SEC_PER_AUDIO_MIN
     assert short.exists()
+
+
+def test_without_accessibility_the_pill_says_what_to_allow(q, monkeypatch):
+    copied = []
+    monkeypatch.setattr(main, "_paste_allowed", lambda: False)
+    monkeypatch.setattr(main, "copy_to_clipboard", copied.append)
+    monkeypatch.setattr(main, "paste_text", lambda text: False)   # refused
+    a = q.queue(1)
+    q.finish(1, "text ")
+    assert copied == ["text "] and not a.exists()
+    assert ("notice", "Copied · allow Accessibility") in q.overlay.events
+
+
+def test_missing_permissions_are_requested_so_the_real_binary_is_listed(monkeypatch):
+    asked = []
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_listen_allowed", lambda: False)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: False)
+    monkeypatch.setattr(main, "_tcc", {
+        "IOHIDRequestAccess": lambda kind: asked.append(("listen", kind)),
+        "AXIsProcessTrustedWithOptions": lambda opts: asked.append(("post", opts)),
+    })
+    assert main.request_permissions() is False
+    assert asked == [
+        ("listen", main.IOHID_LISTEN_EVENT),
+        ("post", {"AXTrustedCheckOptionPrompt": True}),
+    ]
+
+    # Without those functions the CG requests are the fallback.
+    asked.clear()
+    monkeypatch.setattr(main, "_tcc", {})
+    monkeypatch.setattr(main, "CGRequestListenEventAccess", lambda: asked.append("listen"))
+    monkeypatch.setattr(main, "CGRequestPostEventAccess", lambda: asked.append("post"))
+    main.request_permissions()
+    assert asked == ["listen", "post"]
+
+    asked.clear()
+    monkeypatch.setattr(main, "_listen_allowed", lambda: True)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: True)
+    assert main.request_permissions() is True
+    assert asked == []                      # nothing to ask: no prompt
+
+
+def test_a_late_accessibility_grant_restarts_the_app_when_idle(monkeypatch):
+    exits, allowed, sleeps = [], iter([False, True, True, True]), []
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: next(allowed))
+
+    def sleep(_s):
+        sleeps.append(1)
+        if len(sleeps) == 3:
+            main.state = "idle"             # the take finished
+        if len(sleeps) > 4:
+            raise AssertionError("never restarted")
+
+    class _Exit(Exception):
+        pass
+
+    def exit_(code):
+        exits.append(code)
+        raise _Exit()
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    monkeypatch.setattr(main.os, "_exit", exit_)
+    monkeypatch.setattr(main, "state", "recording")      # busy at the grant
+    with pytest.raises(_Exit):
+        main.permission_watch_loop()
+    assert exits == [3] and len(sleeps) == 3
+
+
+def test_a_grant_is_seen_live_even_when_the_preflight_is_stale(monkeypatch):
+    """CGPreflightPostEventAccess can keep reporting the launch state."""
+    monkeypatch.undo()                      # the real _paste_allowed
+    monkeypatch.setattr(main, "CGPreflightPostEventAccess", lambda: False)
+    monkeypatch.setattr(main, "_tcc", {"AXIsProcessTrusted": lambda: True})
+    assert main._paste_allowed() is True
+    monkeypatch.setattr(main, "_tcc", {"AXIsProcessTrusted": lambda: False})
+    assert main._paste_allowed() is False

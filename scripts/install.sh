@@ -135,13 +135,18 @@ launchctl load   "$LAUNCH_AGENTS/${LABEL_APP}.plist"
 
 printf "\n\033[1;32m✓ OpenSpeaksy installed.\033[0m\n\n"
 cat <<EOF
-Next: grant macOS permissions
+Next: three switches in System Settings → Privacy & Security.
+The app has already asked macOS for them, so each list has an entry
+named "Python" (or python3.x): turn it ON (if there are two, both).
 
-System Settings → Privacy & Security:
+  • Input Monitoring  → Python   (the hotkeys)
+  • Accessibility     → Python   (pasting the text; without it, text is only copied)
+    (on the newest macOS this pane is called Device Control and Data Access)
+  • Microphone        → asked on your first dictation: click Allow
 
-  • Input Monitoring  → enable for: $PROJECT_ROOT/venv/bin/python
-  • Accessibility     → enable the same binary
-  • Microphone        → it'll prompt you on first recording; allow
+The app restarts by itself once Accessibility is on. Then check:
+
+  "$PROJECT_ROOT/scripts/doctor.sh"
 
 Using it
 
@@ -161,3 +166,15 @@ To rotate an API key later, edit
 $LAUNCH_AGENTS/${LABEL_APP}.plist
 and re-run: launchctl unload ... && launchctl load ...
 EOF
+
+# Wait (up to 20 s) for the app to start and log what macOS granted, then
+# show where things stand and open the pane that still needs a switch.
+APP_LOG="$HOME/Library/Logs/${LABEL_APP}/main.log"
+for _ in $(seq 1 20); do
+    started="$(grep -n "OpenSpeaksy starting" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1)"
+    reported="$(grep -n "post events trusted:" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1)"
+    [[ -n "$started" && -n "$reported" && "$reported" -gt "$started" ]] && break
+    sleep 1
+done
+echo
+"$PROJECT_ROOT/scripts/doctor.sh" --open || true

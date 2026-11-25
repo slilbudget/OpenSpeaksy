@@ -188,15 +188,39 @@ def test_only_the_latest_flash_ends_the_flashing(monkeypatch):
     assert drawn[-1] == "hidden"
 
 
-def test_queue_dots():
-    assert o._queue_dots("recording", 0) == 0
-    assert o._queue_dots("recording", 1) == 1    # one take behind the recording
-    assert o._queue_dots("recording", 40) == o.DOT_MAX
-    assert o._queue_dots("loading", 1) == 0      # the spinner is that one
-    assert o._queue_dots("loading", 2) == 1      # one waits behind it
-    assert o._queue_dots("loading", 3) == 2
-    assert o._queue_dots("loading", 40) == o.DOT_MAX
-    assert o._queue_dots("error", 3) == 0
+def test_the_pill_splits_only_for_a_recording_with_takes_behind_it():
+    assert o._split_target("recording", 0) == 0.0
+    assert o._split_target("recording", 1) == 1.0
+    assert o._split_target("loading", 3) == 0.0     # the spinner is the pill
+    assert o._split_target("error", 3) == 0.0
+
+
+def test_the_spinner_counts_from_two():
+    assert o._spinner_count("recording", 1) is None
+    assert o._spinner_count("recording", 2) == "2"
+    assert o._spinner_count("loading", 1) is None
+    assert o._spinner_count("loading", 3) == "3"
+    assert o._spinner_count("loading", 12) == "9+"
+    assert o._spinner_count("notice", 3) is None
+
+
+def test_the_split_layout_puts_the_spinner_in_the_left_cap():
+    w0, spin0, bars0 = o._split_layout(0.0)
+    assert w0 == o.W and spin0 == bars0 == o.PANEL_W / 2.0
+    w1, spin1, bars1 = o._split_layout(1.0)
+    left = (o.PANEL_W - w1) / 2.0
+    assert w1 == o.W + o.SPLIT_W
+    assert spin1 == left + o.H / 2.0                # concentric with the cap
+    # Bars clear the spinner with room to spare, inside the pill.
+    assert bars1 - 12 > spin1 + o.SPIN_R + 10
+    assert bars1 + 12 < left + w1 - 10
+
+
+def test_the_glyphs_ease_like_the_pill():
+    assert o._ease(0.0) == 0.0 and o._ease(1.0) == 1.0
+    values = [o._ease(t / 20) for t in range(21)]
+    assert values == sorted(values)
+    assert abs(o._ease(0.5) - 0.776) < 0.01         # cubic-bezier(.4,0,.2,1)
 
 
 def test_a_flash_does_not_freeze_the_pill(monkeypatch):
@@ -253,3 +277,131 @@ def test_the_pill_can_show_over_full_screen_apps():
     pill appear there, so recording looked off in exactly those windows."""
     assert o.PANEL_BEHAVIOR & o.NSWindowCollectionBehaviorFullScreenAuxiliary
     assert o.PANEL_BEHAVIOR & o.NSWindowCollectionBehaviorCanJoinAllSpaces
+
+
+# --- the split pill, frame by frame ------------------------------------------
+
+def _split_rig(monkeypatch):
+    """An OverlayView on a fake clock, recording what it draws, not drawing."""
+    import types
+    from AppKit import NSApplication
+    from Foundation import NSMakeRect
+
+    NSApplication.sharedApplication()
+    o._init_colors()
+    clock = [100.0]
+    monkeypatch.setattr(o, "time", types.SimpleNamespace(monotonic=lambda: clock[0]))
+    drawn = []
+    monkeypatch.setattr(
+        o.OverlayView, "_draw_spinner",
+        lambda self, cx, cy, alpha, count, scale=1.0: drawn.append(
+            ("spin", round(cx - o.PANEL_W / 2, 1), round(alpha, 2), count)),
+    )
+    monkeypatch.setattr(
+        o.OverlayView, "_draw_bars",
+        lambda self, cx, cy, alpha: drawn.append(
+            ("bars", round(cx - o.PANEL_W / 2, 1), round(alpha, 2))),
+    )
+    view = o.OverlayView.alloc().initWithFrame_(NSMakeRect(0, 0, o.PANEL_W, o.PANEL_H))
+
+    def show(mode, queued=0):
+        view.setQueued_(queued)                 # the order Overlay._show uses
+        view.setMode_(mode)
+
+    def run(seconds):
+        frames = []
+        for _ in range(int(round(seconds * 60))):
+            clock[0] += 1 / 60
+            view.tick_(None)
+            drawn.clear()
+            view._draw_overlay()
+            frames.append(list(drawn))
+        return frames
+
+    return view, show, run
+
+
+def _spins(frames):
+    return [next((d for d in f if d[0] == "spin"), None) for f in frames]
+
+
+def test_a_take_started_over_a_transcription_slides_the_spinner_aside(monkeypatch):
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 1)
+    run(0.5)
+    show("recording", 1)
+    frames = run(0.4)
+    xs = [s[1] for s in _spins(frames)]
+    assert xs == sorted(xs, reverse=True)           # always moving left
+    assert xs[-1] == -o.SPIN_SHIFT                  # settles in the cap
+    bars = [next(d for d in f if d[0] == "bars")[2] for f in frames]
+    assert bars[0] == 0.0 and bars[-1] == 1.0        # bars wait, then come in
+
+
+def test_a_slide_that_reverses_fades_out_where_it_stopped(monkeypatch):
+    """The take behind finished before the spinner reached the cap."""
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 1)
+    run(0.5)
+    show("recording", 1)
+    stopped_at = _spins(run(0.15))[-1][1]
+    show("recording", 0)
+    frames = run(0.4)
+    spins = [s for s in _spins(frames) if s]
+    assert all(s[1] == stopped_at for s in spins)   # no ride over the bars
+    alphas = [s[2] for s in spins]
+    assert alphas == sorted(alphas, reverse=True)
+    assert _spins(frames)[-1] is None
+    bars = [next(d for d in f if d[0] == "bars")[2] for f in frames]
+    assert bars == sorted(bars) and bars[-1] == 1.0
+
+
+def test_the_spinner_glides_to_the_middle_when_the_recording_ends(monkeypatch):
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 2)
+    run(0.5)
+    show("recording", 2)
+    run(0.5)
+    show("loading", 2)
+    frames = run(0.4)
+    xs = [s[1] for s in _spins(frames)]
+    assert xs == sorted(xs) and xs[-1] == 0.0
+    assert all(s[2] == 1.0 and s[3] == "2" for s in _spins(frames))
+    assert not any(d[0] == "bars" for f in frames for d in f)
+
+
+def test_a_fade_in_cut_short_by_the_end_of_the_recording_does_not_jump(monkeypatch):
+    view, show, run = _split_rig(monkeypatch)
+    show("recording", 0)
+    run(0.3)
+    show("recording", 1)                            # fades into the cap
+    run(0.12)
+    show("loading", 1)
+    first = _spins(run(1 / 60))[0]
+    assert first[1] <= -o.SPIN_SHIFT + 1 and first[2] == 1.0
+
+
+def test_a_hidden_pill_comes_back_without_a_ghost_spinner(monkeypatch):
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 1)
+    run(0.5)
+    show("recording", 1)
+    run(0.5)
+    view.snapSplit_(0.0)                            # Overlay._hide
+    show("recording", 0)
+    view.snapSplit_(o._split_target("recording", 0))    # Overlay._show, fresh
+    frames = run(1 / 60)
+    assert _spins(frames) == [None]
+    assert next(d for d in frames[0] if d[0] == "bars")[1] == 0.0
+
+
+def test_a_flash_keeps_the_queue_it_covers(monkeypatch):
+    ov, drawn, timers = _overlay(monkeypatch)
+    ov.show("recording", queued=2)
+    ov.flash_error("No connection · retry in 10s")
+    assert drawn[-1][0] == "error" and drawn[-1][3] == 2
+
+
+def test_a_two_character_count_fits_the_arc():
+    assert o._spinner_count("loading", 10) == "9+"
+    assert o.COUNT_SIZE_WIDE < o.COUNT_SIZE

@@ -5,7 +5,7 @@ import objc
 from AppKit import (
     NSView, NSPanel, NSColor, NSBezierPath, NSScreen, NSFont,
     NSFontAttributeName, NSForegroundColorAttributeName, NSKernAttributeName,
-    NSFontWeightLight, NSFontWeightRegular,
+    NSFontWeightLight, NSFontWeightRegular, NSFontWeightSemibold,
     NSFontDescriptorSystemDesignRounded, NSLineCapStyleRound,
     NSMutableParagraphStyle, NSParagraphStyleAttributeName,
     NSLineBreakByWordWrapping, NSTextAlignmentCenter,
@@ -82,16 +82,18 @@ EDGE_RGBA = (1.0, 1.0, 1.0, 0.14)      # Soft light hairline rim
 BAR_RGBA = (190 / 255, 190 / 255, 190 / 255, 1.0)    # Bars / spinner — #bebebe
 BORDER_W = 1.0
 
-# Queue dots: one per take the main glyph is not already showing — under a
-# recording, every take still transcribing; under the spinner, the ones
-# waiting behind it. They sit on a small capsule of the pill's own fill in the
-# margin under the pill, so they read on a white page as well as a dark one.
-DOT_D = 3.0
-DOT_GAP = 3.5
-DOT_MAX = 6
-DOT_RGBA = (190 / 255, 190 / 255, 190 / 255, 0.95)
-DOT_PAD_X = 4.0            # capsule padding around the row of dots
-DOT_PAD_Y = 2.5
+# The split pill, Dynamic Island style. While a take records and earlier ones
+# still transcribe, the pill widens a little and their spinner sits in its
+# left cap, concentric with the rounded end; the recording bars move right.
+# When the recording ends the spinner glides back to the middle and becomes
+# the pill's only glyph. With two or more takes transcribing, their count
+# sits inside the spinner.
+SPLIT_W = 10.0             # extra width of the split pill
+SPIN_R = 7.5               # spinner radius, the same in both places
+SPIN_SHIFT = W / 2.0 + SPLIT_W / 2.0 - H / 2.0      # centre → left cap
+BARS_SHIFT = W / 2.0 + SPLIT_W / 2.0 - 26.0         # centre → right part
+COUNT_SIZE = 8.5
+COUNT_SIZE_WIDE = 7.0       # "9+": two characters inside the same arc
 
 # Mode label ("English" / "Hands-free") — small soft rounded type.
 LABEL_SIZE = 9.5
@@ -112,7 +114,8 @@ NOTICE_SOUND = "Glass"
 
 FILL = None
 EDGE = None
-DOT_COLOR = None
+COUNT_ATTRS = None
+COUNT_FONTS = None
 BAR_COLOR = None           # Recording bars / loading arc
 ERROR_BAR = None           # Error "!"
 LABEL_ATTRS = None
@@ -122,12 +125,11 @@ CLEAR = None
 
 def _init_colors():
     global FILL, EDGE, BAR_COLOR, ERROR_BAR, LABEL_ATTRS, ERROR_ATTRS, CLEAR, _EASE
-    global DOT_COLOR
+    global COUNT_ATTRS, COUNT_FONTS
     if BAR_COLOR is None:
         c = NSColor.colorWithRed_green_blue_alpha_
 
         FILL = c(*FILL_RGBA)
-        DOT_COLOR = c(*DOT_RGBA)
         EDGE = c(*EDGE_RGBA)
         BAR_COLOR = c(*BAR_RGBA)
         ERROR_BAR = c(236 / 255, 112 / 255, 102 / 255, 1.0)
@@ -155,6 +157,19 @@ def _init_colors():
             NSFontAttributeName: label_font,
             NSForegroundColorAttributeName: c(*LABEL_RGBA),
             NSKernAttributeName: LABEL_TRACKING,
+        }
+
+        count_base = NSFont.systemFontOfSize_weight_(COUNT_SIZE, NSFontWeightSemibold)
+        count_rounded = count_base.fontDescriptor().fontDescriptorWithDesign_(
+            NSFontDescriptorSystemDesignRounded
+        )
+        COUNT_FONTS = {
+            size: NSFont.fontWithDescriptor_size_(count_rounded, size) or count_base
+            for size in (COUNT_SIZE, COUNT_SIZE_WIDE)
+        }
+        COUNT_ATTRS = {
+            NSFontAttributeName: COUNT_FONTS[COUNT_SIZE],
+            NSForegroundColorAttributeName: c(*BAR_RGBA),
         }
 
         CLEAR = NSColor.clearColor()
@@ -205,17 +220,60 @@ def _error_frame(message):
     return NSMakeRect((PANEL_W - w) / 2.0, PAD, w, h)
 
 
-def _queue_dots(mode, queued):
-    """How many queue dots to draw under the pill in this mode."""
-    if mode == "recording":
-        return min(queued, DOT_MAX)
-    if mode == "loading":
-        return min(max(queued - 1, 0), DOT_MAX)
-    return 0
+def _split_target(mode, queued):
+    """1 when the pill should be split (a recording with takes behind it)."""
+    return 1.0 if mode == "recording" and queued > 0 else 0.0
 
 
-def _full_frame():
-    return NSMakeRect((PANEL_W - W) / 2.0, PAD, W, H)
+def _spinner_count(mode, queued):
+    """The number drawn inside the spinner: takes transcribing, from two up."""
+    if mode in ("recording", "loading") and queued >= 2:
+        return "9+" if queued > 9 else str(queued)
+    return None
+
+
+def _ease(t):
+    """
+    The pill's own timing curve, cubic-bezier(0.4, 0, 0.2, 1) — the one the
+    surface animates its frame with — so glyphs drawn by hand move in step
+    with the pill they sit in.
+    """
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    x1, y1, x2, y2 = 0.4, 0.0, 0.2, 1.0
+
+    def bez(u, a, b):
+        return 3 * a * u * (1 - u) ** 2 + 3 * b * u * u * (1 - u) + u ** 3
+
+    lo, hi = 0.0, 1.0
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        if bez(mid, x1, x2) < t:
+            lo = mid
+        else:
+            hi = mid
+    return bez((lo + hi) / 2.0, y1, y2)
+
+
+def _bars_fade(split):
+    """Bars' alpha while a spinner slides out of their way: held back, then in."""
+    return min(1.0, max(0.0, (split - 0.6) / 0.4))
+
+
+def _split_layout(split):
+    """
+    (pill_width, spinner_x, bars_x) for a pill `split` of the way from the
+    plain pill (0) to the split one (1), in panel coordinates.
+    """
+    cx = PANEL_W / 2.0
+    return W + SPLIT_W * split, cx - SPIN_SHIFT * split, cx + BARS_SHIFT * split
+
+
+def _pill_frame(mode, queued):
+    w, _, _ = _split_layout(_split_target(mode, queued))
+    return NSMakeRect((PANEL_W - w) / 2.0, PAD, w, H)
 
 
 def _circle_frame():
@@ -266,6 +324,19 @@ class OverlayView(NSView):
             self._message = None
             self._queued = 0
             self._phase = 0.0
+            # The spinner turns on its own clock, so it keeps spinning
+            # smoothly when it moves from the side to the middle.
+            self._spin = 0.0
+            # Split tween: 0 plain pill, 1 split (see SPLIT_W).
+            self._split = 0.0
+            self._split_from = 0.0
+            self._split_to = 0.0
+            self._split_t0 = 0.0
+            # True when the spinner arrived from the middle (the recording
+            # started over a transcription), so it glides rather than fades.
+            self._spin_slides = False
+            # The count a spinner fading out of the cap keeps showing.
+            self._last_count = None
             _init_colors()
             self.setWantsLayer_(True)
 
@@ -292,8 +363,19 @@ class OverlayView(NSView):
 
     def setMode_(self, mode):
         if self._mode != mode:
+            previous = self._mode
             self._mode = mode
             self._phase = 0.0
+            if mode == "recording":
+                self._spin_slides = previous == "loading"
+            elif (
+                mode == "loading" and previous == "recording"
+                and not self._spin_slides and 0.0 < self._split < 1.0
+            ):
+                # The recording ended while its spinner was still fading into
+                # the cap: start the glide from the cap, not from mid-pill.
+                self._split = 1.0
+            self._retarget_split()
             self._glyph.setNeedsDisplay_(True)
 
     def setLabel_(self, label):
@@ -303,8 +385,39 @@ class OverlayView(NSView):
 
     def setQueued_(self, queued):
         if self._queued != queued:
+            if self._mode == "recording" and self._queued == 0 and queued > 0:
+                self._spin_slides = False      # a take behind it: fade in
             self._queued = queued
+            self._retarget_split()
             self._glyph.setNeedsDisplay_(True)
+
+    def _retarget_split(self):
+        if self._mode not in ("recording", "loading"):
+            return                             # a message keeps the layout
+        target = _split_target(self._mode, self._queued)
+        if target != self._split_to:
+            self._split_from = self._split
+            self._split_to = target
+            self._split_t0 = time.monotonic()
+
+    def snapSplit_(self, target):
+        """Jump to a layout with no tween (the pill is hidden or reappearing)."""
+        self._split = self._split_from = self._split_to = float(target)
+        self._spin_slides = False
+
+    def _advance_split(self):
+        """Move the split tween on; True while it is still moving."""
+        if self._split == self._split_to:
+            return False
+        t = (time.monotonic() - self._split_t0) / EXPAND_IN
+        eased = _ease(t)
+        self._split = self._split_from + (self._split_to - self._split_from) * eased
+        if t >= 1.0:
+            self._split = self._split_to
+            # Settled: from here on the spinner in the cap is an ordinary
+            # one, and fades out in place when the takes behind are done.
+            self._spin_slides = False
+        return True
 
     def setMessage_(self, message):
         if self._message != message:
@@ -326,23 +439,23 @@ class OverlayView(NSView):
         self._animate_surface(_error_frame(message), EXPAND_IN)
 
     def expand(self):
-        self._animate_surface(_full_frame(), EXPAND_IN)
+        self._animate_surface(_pill_frame(self._mode, self._queued), EXPAND_IN)
 
     def collapse(self):
         self._animate_surface(_circle_frame(), EXPAND_OUT)
 
     def tick_(self, timer):
+        self._advance_split()
         if self._mode == "recording":
             self._phase += 0.1
-            self._glyph.setNeedsDisplay_(True)
-        elif self._mode == "loading":
-            self._phase += 4.0
+        if self._mode in ("recording", "loading"):
+            self._spin = (self._spin + 4.0) % 360.0
             self._glyph.setNeedsDisplay_(True)
 
     def _draw_overlay(self):
-        # The glyph layer spans the whole panel; the pill occupies _full_frame,
-        # so the glyph is drawn in pill-local coordinates and the label sits in
-        # the margin above it.
+        # The glyph layer spans the whole panel; the pill occupies _pill_frame,
+        # so the glyphs are placed in panel coordinates (_split_layout) and the
+        # label sits in the margin above it.
         if self._label and self._mode not in _MESSAGE_MODES:
             s = NSAttributedString.alloc().initWithString_attributes_(self._label, LABEL_ATTRS)
             sz = s.size()
@@ -351,24 +464,6 @@ class OverlayView(NSView):
             s.drawAtPoint_(NSMakePoint(x, y))
 
         cx, cy = PANEL_W / 2.0, PAD + H / 2.0
-
-        dots = _queue_dots(self._mode, self._queued)
-        if dots:
-            row = dots * DOT_D + (dots - 1) * DOT_GAP
-            x0 = cx - row / 2.0
-            y = (PAD - DOT_D) / 2.0
-            capsule = NSMakeRect(
-                x0 - DOT_PAD_X, y - DOT_PAD_Y,
-                row + 2 * DOT_PAD_X, DOT_D + 2 * DOT_PAD_Y,
-            )
-            r = capsule.size.height / 2.0
-            FILL.setFill()
-            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(capsule, r, r).fill()
-            DOT_COLOR.setFill()
-            for i in range(dots):
-                NSBezierPath.bezierPathWithOvalInRect_(
-                    NSMakeRect(x0 + i * (DOT_D + DOT_GAP), y, DOT_D, DOT_D)
-                ).fill()
 
         if self._mode in _MESSAGE_MODES:
             if self._message:
@@ -396,32 +491,76 @@ class OverlayView(NSView):
                     NSMakeRect(cx - 1, cy - 8, 2, 2), 1, 1
                 ).fill()
 
-        elif self._mode == "recording":
-            # Center-weighted envelope reads like a real voice meter.
-            env = (0.55, 0.8, 1.0, 0.8, 0.55)
-            barW, gap = 2.0, 3.5
-            total = 5 * barW + 4 * gap
-            x0 = cx - total / 2.0
-            BAR_COLOR.setFill()
-            for i in range(5):
-                t = math.sin(self._phase + i * 1.2) * 0.5 + 0.5
-                h = 5 + t * 11 * env[i]
-                y = cy - h / 2.0
-                NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                    NSMakeRect(x0 + i * (barW + gap), y, barW, h), 1, 1
-                ).fill()
+        elif self._mode in ("recording", "loading"):
+            _, spin_x, bars_x = _split_layout(self._split)
+            count = _spinner_count(self._mode, self._queued)
+            if count is not None:
+                self._last_count = count
+            if self._mode == "loading":
+                # The spinner, gliding back to the middle if it was in the cap.
+                self._draw_spinner(spin_x, cy, 1.0, count)
+                return
+            bars_alpha = 1.0
+            if self._split > 0.0:
+                fading = count or (self._last_count if self._split_to == 0.0 else None)
+                if self._spin_slides and self._split_to == 1.0:
+                    # Sliding from the middle into the cap; the bars come in
+                    # once it has made room for them.
+                    self._draw_spinner(spin_x, cy, 1.0, count)
+                    bars_alpha = _bars_fade(self._split)
+                elif self._spin_slides:
+                    # That slide reversed (the take behind finished first):
+                    # fade out where it stopped, as the bars come back.
+                    frac = self._split / self._split_from if self._split_from else 0.0
+                    _, from_x, _ = _split_layout(self._split_from)
+                    self._draw_spinner(from_x, cy, frac, fading)
+                    bars_alpha = 1.0 - (1.0 - _bars_fade(self._split_from)) * frac
+                else:
+                    # In place: fade and grow into the cap, or out of it.
+                    _, side_x, _ = _split_layout(1.0)
+                    self._draw_spinner(
+                        side_x, cy, self._split, fading,
+                        scale=0.6 + 0.4 * self._split,
+                    )
+            self._draw_bars(bars_x, cy, bars_alpha)
 
-        elif self._mode == "loading":
-            # A single clean arc, round caps, no background track — a calm,
-            # minimal spinner.
-            BAR_COLOR.setStroke()
-            arc = NSBezierPath.bezierPath()
-            arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
-                NSMakePoint(cx, cy), 7.5, self._phase, self._phase + 270, False
-            )
-            arc.setLineWidth_(2.0)
-            arc.setLineCapStyle_(NSLineCapStyleRound)
-            arc.stroke()
+    def _draw_bars(self, cx, cy, alpha):
+        # Center-weighted envelope reads like a real voice meter.
+        env = (0.55, 0.8, 1.0, 0.8, 0.55)
+        barW, gap = 2.0, 3.5
+        total = 5 * barW + 4 * gap
+        x0 = cx - total / 2.0
+        BAR_COLOR.colorWithAlphaComponent_(alpha).setFill()
+        for i in range(5):
+            t = math.sin(self._phase + i * 1.2) * 0.5 + 0.5
+            h = 5 + t * 11 * env[i]
+            y = cy - h / 2.0
+            NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(x0 + i * (barW + gap), y, barW, h), 1, 1
+            ).fill()
+
+    def _draw_spinner(self, cx, cy, alpha, count, scale=1.0):
+        # A single clean arc, round caps, no background track — a calm,
+        # minimal spinner. A count, when there is one, sits inside it.
+        if alpha <= 0.0:
+            return
+        BAR_COLOR.colorWithAlphaComponent_(alpha).setStroke()
+        arc = NSBezierPath.bezierPath()
+        arc.appendBezierPathWithArcWithCenter_radius_startAngle_endAngle_clockwise_(
+            NSMakePoint(cx, cy), SPIN_R * scale, self._spin, self._spin + 270, False
+        )
+        arc.setLineWidth_(2.0 if count is None else 1.75)
+        arc.setLineCapStyle_(NSLineCapStyleRound)
+        arc.stroke()
+        if count is not None:
+            attrs = dict(COUNT_ATTRS)
+            attrs[NSFontAttributeName] = COUNT_FONTS[
+                COUNT_SIZE if len(count) == 1 else COUNT_SIZE_WIDE
+            ]
+            attrs[NSForegroundColorAttributeName] = BAR_COLOR.colorWithAlphaComponent_(alpha)
+            text = NSAttributedString.alloc().initWithString_attributes_(count, attrs)
+            size = text.size()
+            text.drawAtPoint_(NSMakePoint(cx - size.width / 2.0, cy - size.height / 2.0))
 
 
 class Overlay:
@@ -503,7 +642,9 @@ class Overlay:
         self._flashing = True
         self._flash_started = time.monotonic()
         try:
-            self._show(mode, None, message)
+            # The base's queue count rides along, so the split layout under
+            # the message is still there when the flash ends.
+            self._show(mode, None, message, queued=self._base[2] if self._base else 0)
         finally:
             # Always armed: a flash whose drawing failed must still end, or
             # every later show()/hide() would wait behind it forever.
@@ -581,10 +722,14 @@ class Overlay:
         # Back on top on every show: since the last one the user may have
         # switched Spaces or another app may have raised a window this high.
         self._panel.orderFrontRegardless()
+        fresh = self._timer is None          # hidden until now
         self._view.setLabel_(label)
         self._view.setMessage_(message)
         self._view.setQueued_(queued)
         self._view.setMode_(mode)
+        if fresh and not message:
+            # Appearing from nothing: no tween from whatever it showed last.
+            self._view.snapSplit_(_split_target(mode, queued))
 
         # The redraw timer runs only while the pill is visible.
         if self._timer is None:
@@ -609,6 +754,9 @@ class Overlay:
             return
         self._hiding = True
 
+        # The pill shrinks to a circle: glyphs left at the split positions
+        # would sit outside it for the fade.
+        self._view.snapSplit_(0.0)
         self._view.collapse()
 
         # Fade out over the same span the pill collapses. The panel is kept

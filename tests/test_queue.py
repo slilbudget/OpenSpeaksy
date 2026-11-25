@@ -322,6 +322,10 @@ def test_three_takes_end_to_end_paste_in_spoken_order(monkeypatch, tmp_path):
     deadline = time.monotonic() + 3
     while main._jobs and time.monotonic() < deadline:
         time.sleep(0.02)
+    # The drain takes jobs out of _jobs first and deletes their files last,
+    # all under _clipboard_gate: wait for it to finish.
+    with main._clipboard_gate:
+        pass
 
     assert main._jobs == {}
     # How they batch depends on timing; the order and the words never do.

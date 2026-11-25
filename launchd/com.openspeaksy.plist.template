@@ -8,6 +8,9 @@
     <string>Aqua</string>
     <key>ProgramArguments</key>
     <array>
+        <!-- The launcher runs Python as its child, so macOS lists the
+             permissions under "OpenSpeaksy" (app/launcher.c). -->
+        <string>__PROJECT_ROOT__/OpenSpeaksy.app/Contents/MacOS/OpenSpeaksy</string>
         <string>__PROJECT_ROOT__/venv/bin/python</string>
         <string>__PROJECT_ROOT__/main.py</string>
     </array>

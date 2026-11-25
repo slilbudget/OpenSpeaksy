@@ -40,7 +40,7 @@ git clone https://github.com/slilbudget/OpenSpeaksy.git ~/OpenSpeaksy
 cd ~/OpenSpeaksy && ./scripts/install.sh
 ```
 
-Then, either way: **System Settings → Privacy & Security** → in **Input Monitoring** and **Accessibility** (on the newest macOS: *Device Control and Data Access*), turn on **Python** (the app has already added it; it may read python3.x; if there are two, both). Allow the **Microphone** prompt on the first recording. `./scripts/doctor.sh` checks it all and says what's missing.
+Then, either way, macOS asks three times, one after the other: **Allow** the microphone; then twice **Open System Settings** → turn on **OpenSpeaksy** (Input Monitoring for the keys, then Accessibility for the pasting; on the newest macOS: *Device Control and Data Access*). After each switch the app restarts itself. `./scripts/doctor.sh` checks it all and says what's missing.
 
 ## Settings
 
@@ -72,9 +72,9 @@ Audio goes only to Mistral, under your key. No telemetry; transcripts and the ke
 
 | Problem | Fix |
 |:---|:---|
-| Nothing happens | **Input Monitoring** → Python on |
-| Text is only copied (pill: "Copied · allow Accessibility") | **Accessibility** → Python on |
-| Stopped after `brew upgrade` | Re-run `./scripts/install.sh`, switch the new Python on |
+| Nothing happens | **Input Monitoring** → OpenSpeaksy on |
+| Text is only copied (pill: "Copied · allow Accessibility") | **Accessibility** → OpenSpeaksy on |
+| Stopped after `brew upgrade` | Re-run `./scripts/install.sh` (the switches stay on) |
 | Pill says **Mic blocked** | Allow **Microphone** |
 | Caps Lock types capitals | Keyboard → Modifier Keys → Caps Lock → **No Action** |
 | Anything else | `./scripts/doctor.sh`, then `tail -f ~/Library/Logs/com.openspeaksy/main.log` |

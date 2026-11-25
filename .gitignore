@@ -3,6 +3,10 @@
 .notes/
 vocabulary.txt
 
+# Built by scripts/build_app.sh
+OpenSpeaksy.app/
+.OpenSpeaksy.app.*/
+
 # Python
 venv/
 __pycache__/

@@ -16,6 +16,11 @@ launchctl unload "$LAUNCH_AGENTS/${LABEL_APP}.plist" 2>/dev/null || true
 echo "==> Removing LaunchAgent plist"
 rm -f "$LAUNCH_AGENTS/${LABEL_APP}.plist"
 
+echo "==> Revoking its permissions"
+# The grants belong to OpenSpeaksy.app's bundle id, so this clears exactly
+# them (installs before 1.5 ran as "Python": remove that entry by hand).
+tccutil reset All com.openspeaksy >/dev/null 2>&1 || true
+
 echo "==> Cleaning logs"
 rm -f /tmp/openspeaksy.log   # where installs before 2026-11 sent stdout
 rm -rf "$HOME/Library/Logs/com.openspeaksy"
@@ -34,6 +39,6 @@ fallback queue. It holds audio, so remove it too if you are done:
 
     rm -rf "$HOME/Library/Application Support/OpenSpeaksy"
 
-You may also want to revoke Input Monitoring / Accessibility permissions in
-System Settings → Privacy & Security.
+Its permissions were revoked. If System Settings → Privacy & Security still
+lists "Python" from an older install, remove that entry with the − button.
 EOF

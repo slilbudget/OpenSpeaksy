@@ -665,61 +665,171 @@ def test_without_accessibility_the_pill_says_what_to_allow(q, monkeypatch):
     assert ("notice", "Copied · allow Accessibility") in q.overlay.events
 
 
-def test_missing_permissions_are_requested_so_the_real_binary_is_listed(monkeypatch):
+def _ask_rig(monkeypatch, listen, post, mic=None):
     asked = []
     monkeypatch.setattr(main, "log", lambda m: None)
-    monkeypatch.setattr(main, "_listen_allowed", lambda: False)
-    monkeypatch.setattr(main, "_paste_allowed", lambda: False)
+    monkeypatch.setattr(main, "_listen_allowed", lambda: listen)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: post)
+    monkeypatch.setattr(main, "microphone_authorization_status",
+                        lambda: main.MICROPHONE_AUTH_AUTHORIZED if mic is None else mic)
     monkeypatch.setattr(main, "_tcc", {
         "IOHIDRequestAccess": lambda kind: asked.append(("listen", kind)),
         "AXIsProcessTrustedWithOptions": lambda opts: asked.append(("post", opts)),
     })
-    assert main.request_permissions() is False
-    assert asked == [
-        ("listen", main.IOHID_LISTEN_EVENT),
-        ("post", {"AXTrustedCheckOptionPrompt": True}),
-    ]
+    return asked
 
-    # Without those functions the CG requests are the fallback.
-    asked.clear()
+
+def test_one_permission_is_asked_for_per_start(monkeypatch):
+    """One dialog at a time: the grant restarts the app, which asks the next."""
+    asked = _ask_rig(monkeypatch, listen=False, post=False)
+    assert main.request_permissions() == (False, False)
+    assert asked == [("listen", main.IOHID_LISTEN_EVENT)]
+
+    asked = _ask_rig(monkeypatch, listen=True, post=False)
+    assert main.request_permissions() == (True, False)
+    assert asked == [("post", {"AXTrustedCheckOptionPrompt": True})]
+
+    asked = _ask_rig(monkeypatch, listen=True, post=True)
+    assert main.request_permissions() == (True, True)
+    assert asked == []                      # nothing to ask: no prompt
+
+
+def test_without_the_tcc_functions_the_cg_requests_ask(monkeypatch):
+    asked = []
+    _ask_rig(monkeypatch, listen=False, post=False)
     monkeypatch.setattr(main, "_tcc", {})
     monkeypatch.setattr(main, "CGRequestListenEventAccess", lambda: asked.append("listen"))
     monkeypatch.setattr(main, "CGRequestPostEventAccess", lambda: asked.append("post"))
     main.request_permissions()
+    monkeypatch.setattr(main, "_listen_allowed", lambda: True)
+    main.request_permissions()
     assert asked == ["listen", "post"]
 
-    asked.clear()
-    monkeypatch.setattr(main, "_listen_allowed", lambda: True)
-    monkeypatch.setattr(main, "_paste_allowed", lambda: True)
-    assert main.request_permissions() is True
-    assert asked == []                      # nothing to ask: no prompt
+
+def test_the_microphone_is_asked_first_and_the_next_one_after_it(monkeypatch):
+    asked = _ask_rig(monkeypatch, listen=False, post=False,
+                     mic=main.MICROPHONE_AUTH_NOT_DETERMINED)
+    pending = []
+    monkeypatch.setattr(main, "request_microphone", pending.append)
+    main.request_permissions()
+    assert asked == [] and len(pending) == 1    # waits for the answer
+    pending[0]()
+    assert asked == [("listen", main.IOHID_LISTEN_EVENT)]
 
 
-def test_a_late_accessibility_grant_restarts_the_app_when_idle(monkeypatch):
-    exits, allowed, sleeps = [], iter([False, True, True, True]), []
-    monkeypatch.setattr(main, "log", lambda m: None)
-    monkeypatch.setattr(main, "_paste_allowed", lambda: next(allowed))
+class _FakeCaptureDevice:
+    answer = None                           # None: the user leaves the prompt open
 
-    def sleep(_s):
-        sleeps.append(1)
-        if len(sleeps) == 3:
-            main.state = "idle"             # the take finished
-        if len(sleeps) > 4:
-            raise AssertionError("never restarted")
+    @classmethod
+    def requestAccessForMediaType_completionHandler_(cls, media, handler):
+        assert media == main.MICROPHONE_MEDIA_TYPE
+        if cls.answer is not None:
+            handler(cls.answer)
 
-    class _Exit(Exception):
-        pass
+
+def test_the_microphone_request_moves_on_once(monkeypatch):
+    lines, calls = [], []
+    monkeypatch.setattr(main, "log", lines.append)
+    monkeypatch.setattr(main.objc, "lookUpClass", lambda name: _FakeCaptureDevice)
+    monkeypatch.setattr(main, "MICROPHONE_PROMPT_WAIT_SEC", 0.05)
+
+    _FakeCaptureDevice.answer = True
+    main.request_microphone(lambda: calls.append("next"))
+    time.sleep(0.15)                        # the wait timer fires too: no second call
+    assert calls == ["next"]
+    assert "microphone permission trusted: True" in lines   # the doctor reads it
+
+    calls.clear()
+    _FakeCaptureDevice.answer = False
+    main.request_microphone(lambda: calls.append("next"))
+    assert calls == ["next"]
+    assert any("Microphone permission is denied" in l for l in lines)
+
+    # Left open: the next prompt still comes, after the wait.
+    calls.clear()
+    _FakeCaptureDevice.answer = None
+    main.request_microphone(lambda: calls.append("next"))
+    assert calls == []
+    time.sleep(0.15)
+    assert calls == ["next"]
+
+    # No AVFoundation: move straight on.
+    calls.clear()
+    def missing(name):
+        raise main.objc.error("no AVCaptureDevice")
+    monkeypatch.setattr(main.objc, "lookUpClass", missing)
+    main.request_microphone(lambda: calls.append("next"))
+    assert calls == ["next"]
+
+
+class _Exit(Exception):
+    pass
+
+
+def _record_exits(monkeypatch):
+    exits = []
 
     def exit_(code):
         exits.append(code)
         raise _Exit()
 
-    monkeypatch.setattr(main.time, "sleep", sleep)
     monkeypatch.setattr(main.os, "_exit", exit_)
+    return exits
+
+
+def _watch(monkeypatch, listen_at_start, post_at_start, max_sleeps=5):
+    sleeps = []
+
+    def sleep(_s):
+        sleeps.append(1)
+        if len(sleeps) == 3:
+            main.state = "idle"             # the take finished
+        if len(sleeps) > max_sleeps:
+            raise AssertionError("never restarted")
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    exits = _record_exits(monkeypatch)
     monkeypatch.setattr(main, "state", "recording")      # busy at the grant
     with pytest.raises(_Exit):
-        main.permission_watch_loop()
+        main.permission_watch_loop(listen_at_start, post_at_start)
+    return exits, sleeps
+
+
+def test_a_late_accessibility_grant_restarts_the_app_when_idle(monkeypatch):
+    allowed = iter([False, True, True, True])
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: next(allowed))
+    exits, sleeps = _watch(monkeypatch, True, False)
     assert exits == [3] and len(sleeps) == 3
+
+
+def test_a_late_input_monitoring_grant_restarts_the_app(monkeypatch):
+    """The tap is handed out blind without the grant; only a restart fixes it."""
+    allowed = iter([False, True, True, True])
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_listen_allowed", lambda: next(allowed))
+    monkeypatch.setattr(main, "_paste_allowed", lambda: False)
+    exits, sleeps = _watch(monkeypatch, False, False)
+    assert exits == [3] and len(sleeps) == 3
+
+
+def test_the_watch_ends_when_nothing_is_missing(monkeypatch):
+    monkeypatch.setattr(main.time, "sleep",
+                        lambda s: (_ for _ in ()).throw(AssertionError("polled")))
+    main.permission_watch_loop(True, True)
+
+
+def test_a_refused_tap_without_the_grant_waits_instead_of_relaunching(monkeypatch):
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "CGEventTapCreate", lambda *a: None)
+    monkeypatch.setattr(main, "_listen_allowed", lambda: False)
+    exits = _record_exits(monkeypatch)
+    main.run_event_tap()                    # a relaunch would only ask again
+    assert exits == []
+    monkeypatch.setattr(main, "_listen_allowed", lambda: True)
+    with pytest.raises(_Exit):
+        main.run_event_tap()                # granted yet refused: launchd retries
+    assert exits == [1]
 
 
 def test_a_grant_is_seen_live_even_when_the_preflight_is_stale(monkeypatch):

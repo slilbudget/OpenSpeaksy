@@ -249,6 +249,55 @@ def _microphone_access_is_blocked():
     return status in MICROPHONE_BLOCKED
 
 
+MICROPHONE_PROMPT_WAIT_SEC = 60
+
+
+def request_microphone(then):
+    """
+    Ask for the microphone now, so the install asks everything up front
+    instead of on the first dictation, then call `then` once: when the user
+    has answered, or after MICROPHONE_PROMPT_WAIT_SEC if they leave the prompt
+    open (it would otherwise stack with the next one). Any failure to ask
+    just calls `then`: recording asks again by itself.
+    """
+    once = threading.Lock()
+
+    def proceed(*_):
+        if once.acquire(blocking=False):
+            then()
+
+    def answered(granted):
+        if granted:
+            log("microphone permission trusted: True")
+        else:
+            log(
+                "ERROR: Microphone permission is denied or restricted; enable it "
+                "in System Settings > Privacy & Security > Microphone"
+            )
+        proceed()
+
+    try:
+        objc.registerMetaDataForSelector(
+            b"AVCaptureDevice",
+            b"requestAccessForMediaType:completionHandler:",
+            {"arguments": {3: {"callable": {
+                "retval": {"type": b"v"},
+                "arguments": {0: {"type": b"^v"}, 1: {"type": b"Z"}},
+            }}}},
+        )
+        capture_device = objc.lookUpClass("AVCaptureDevice")
+        timer = threading.Timer(MICROPHONE_PROMPT_WAIT_SEC, proceed)
+        timer.daemon = True
+        timer.start()
+        log("requested Microphone")
+        capture_device.requestAccessForMediaType_completionHandler_(
+            MICROPHONE_MEDIA_TYPE, answered
+        )
+    except Exception as e:
+        log(f"microphone request unavailable: {e}")
+        proceed()
+
+
 def handle_shutdown(signum, _frame):
     global state, state_ts, current_hotkey, current_mode
 
@@ -1708,75 +1757,104 @@ def tap_callback(proxy, event_type, event, refcon):
 PERMISSION_POLL_SEC = 2
 
 
+def _ask_input_monitoring():
+    # IOHIDRequestAccess is what Apple recommends; the CG call is the older
+    # route. Either shows a dialog that offers to open System Settings.
+    request = _tcc.get("IOHIDRequestAccess")
+    if request:
+        request(IOHID_LISTEN_EVENT)
+    else:
+        CGRequestListenEventAccess()
+    log(
+        "requested Input Monitoring: turn on OpenSpeaksy in System Settings > "
+        "Privacy & Security > Input Monitoring; until then the keys do nothing"
+    )
+
+
+def _ask_accessibility():
+    # The prompt option adds the entry and offers to open System Settings;
+    # the CG call is the fallback.
+    prompt = _tcc.get("AXIsProcessTrustedWithOptions")
+    if prompt:
+        prompt({"AXTrustedCheckOptionPrompt": True})
+    else:
+        CGRequestPostEventAccess()
+    log(
+        "requested Accessibility (on the newest macOS: Device Control and "
+        "Data Access): turn on OpenSpeaksy in System Settings > Privacy & "
+        "Security; until then text is copied, not pasted"
+    )
+
+
 def request_permissions():
     """
-    Ask macOS for the two permissions the hotkeys and the paste need, and log
-    where they stand.
+    Log where the permissions stand and ask macOS for the next one missing,
+    one dialog at a time: the microphone, then Input Monitoring (the hotkeys),
+    then Accessibility (the ⌘V). Each grant restarts the app
+    (permission_watch_loop), and the next start asks for the next one, so
+    the user only ever answers one dialog and turns one switch on. Asking is
+    also what makes macOS list the app, as "OpenSpeaksy" when it runs inside
+    OpenSpeaksy.app (the launcher).
 
-    Asking is what puts the right entry in System Settings: the process that
-    runs is Homebrew's Python (a versioned path inside its Cellar, shown as
-    "Python"), not the venv's python symlink, so a user adding the venv path
-    by hand grants a binary that never runs, and the paste stays off. Asking
-    adds the real one; the user only turns it on.
-
-    Returns whether posting the ⌘V is allowed.
+    Returns (listen, post): what was allowed at start.
     """
     listen = _listen_allowed()
     post = _paste_allowed()
     log(f"input monitoring trusted: {listen}; post events trusted: {post}")
-    if not listen:
-        # IOHIDRequestAccess is what Apple recommends to get the Input
-        # Monitoring entry listed; the CG call is the older route.
-        request = _tcc.get("IOHIDRequestAccess")
-        if request:
-            request(IOHID_LISTEN_EVENT)
-        else:
-            CGRequestListenEventAccess()
-        log(
-            "requested Input Monitoring: turn on Python in System Settings > "
-            "Privacy & Security > Input Monitoring"
-        )
-    if not post:
-        # The prompt option adds the Accessibility entry and offers to open
-        # System Settings; the CG call is the fallback.
-        prompt = _tcc.get("AXIsProcessTrustedWithOptions")
-        if prompt:
-            prompt({"AXTrustedCheckOptionPrompt": True})
-        else:
-            CGRequestPostEventAccess()
-        log(
-            "requested Accessibility (on the newest macOS: Device Control and "
-            "Data Access): turn on Python in System Settings > Privacy & "
-            "Security; until then text is copied, not pasted"
-        )
-    return post
+
+    def ask_next():
+        if not listen:
+            _ask_input_monitoring()
+        elif not post:
+            _ask_accessibility()
+
+    if microphone_authorization_status() == MICROPHONE_AUTH_NOT_DETERMINED:
+        request_microphone(ask_next)
+    else:
+        ask_next()
+    return listen, post
 
 
-def permission_watch_loop():
+def _restart_due(listen_at_start, post_at_start):
+    """Whether a grant missing at start has landed since."""
+    return (
+        (not listen_at_start and _listen_allowed())
+        or (not post_at_start and _paste_allowed())
+    )
+
+
+def permission_watch_loop(listen_at_start, post_at_start):
     """
-    Restart once Accessibility is granted while running. A grant that lands
-    after start is not reliably honoured by a process that was refused at
-    start (Apple: "when you grant access via System Settings, it offers to
-    relaunch the app"), and that is how a fresh install ends up copying
-    instead of pasting. _paste_allowed reads the live AX state, so the grant
-    is seen here even when the CG preflight still reports the launch state. Waits for an idle moment, so no take is cut short; launchd starts
-    the app again within seconds (a nonzero exit, see the plist's KeepAlive).
+    Restart once a permission missing at start is granted. A grant made after
+    start is not honoured by a process that was refused at start (Apple:
+    "when you grant access via System Settings, it offers to relaunch the
+    app"): the hotkey tap stays blind and the ⌘V stays refused, which is how
+    a fresh install ends up doing nothing, or copying instead of pasting. The
+    checks read the live state (_listen_allowed, _paste_allowed), which sees a
+    grant even when the CG preflight still reports the launch state. Waits
+    for an idle moment, so no take is cut short; launchd starts the app again
+    within seconds (a nonzero exit, see the plist's KeepAlive).
     """
+    if listen_at_start and post_at_start:
+        return
     while True:
         time.sleep(PERMISSION_POLL_SEC)
-        if not _paste_allowed():
+        if not _restart_due(listen_at_start, post_at_start):
             continue
         with state_lock:
             busy = state != "idle" or bool(_jobs)
         if busy:
             continue
-        log("Accessibility granted; restarting to pick it up")
+        log("permission granted; restarting to pick it up")
         os._exit(3)
 
 
 def run_event_tap():
     global tap_ref, source_ref
 
+    # Without Input Monitoring macOS usually still hands out the tap, but
+    # blind: it never sees a key. The grant and the restart that follows
+    # are what fix that (permission_watch_loop), not this check.
     tap_ref = CGEventTapCreate(
         kCGSessionEventTap,
         kCGHeadInsertEventTap,
@@ -1787,8 +1865,12 @@ def run_event_tap():
     )
     if tap_ref is None:
         log("Failed to create event tap")
-        log("Grant Input Monitoring: System Settings > Privacy & Security > Input Monitoring")
-        os._exit(1)
+        if _listen_allowed():
+            # Granted, yet refused: the session may not be ready. Exit
+            # nonzero so launchd tries again. Without the grant, a relaunch
+            # would only ask again; the watch loop restarts on the grant.
+            os._exit(1)
+        return
 
     source_ref = CFMachPortCreateRunLoopSource(None, tap_ref, 0)
     CFRunLoopAddSource(CFRunLoopGetCurrent(), source_ref, kCFRunLoopDefaultMode)
@@ -1864,8 +1946,13 @@ def main():
     # cannot race the recovery clipboard write.
     recover_pending_recordings()
 
-    if not request_permissions():
-        threading.Thread(target=permission_watch_loop, daemon=True).start()
+    listen, post = request_permissions()
+    threading.Thread(
+        target=permission_watch_loop, args=(listen, post), daemon=True
+    ).start()
+    if not listen:
+        overlay.flash_notice("Allow Input Monitoring for the keys", sound=False)
+    elif not post:
         overlay.flash_notice("Allow Accessibility to paste", sound=False)
     threading.Thread(target=watchdog_loop, daemon=True).start()
     threading.Thread(target=pending_retry_loop, daemon=True).start()

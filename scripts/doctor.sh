@@ -37,15 +37,27 @@ echo
 
 if [[ -x "$PROJECT_ROOT/venv/bin/python" ]]; then
     ok "Python venv"
-    REAL_PYTHON="$("$PROJECT_ROOT/venv/bin/python" -c 'import os, sys; print(os.path.realpath(sys.executable))' 2>/dev/null)"
 else
     bad "Python venv missing"
     fix "run ./scripts/install.sh"
-    REAL_PYTHON=""
+fi
+
+APP="$PROJECT_ROOT/OpenSpeaksy.app"
+if [[ -x "$APP/Contents/MacOS/OpenSpeaksy" ]] && codesign --verify "$APP" 2>/dev/null; then
+    ok "OpenSpeaksy.app"
+else
+    bad "OpenSpeaksy.app missing or broken"
+    fix "run ./scripts/install.sh"
 fi
 
 if [[ -f "$PLIST" ]]; then
     ok "LaunchAgent installed"
+    runs="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)"
+    if [[ "$runs" != "$APP/Contents/MacOS/OpenSpeaksy" ]]; then
+        bad "the LaunchAgent starts Python directly (an install from before 1.5)"
+        fix "run ./scripts/install.sh again: permissions then show as OpenSpeaksy"
+    fi
+    unset runs
     key="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:MISTRAL_API_KEY" "$PLIST" 2>/dev/null || true)"
     if [[ -n "$key" && "$key" != "__MISTRAL_API_KEY__" ]]; then
         ok "Mistral API key set"
@@ -94,9 +106,10 @@ if ! grep -q "post events trusted:" <<<"$block"; then
     bad "the app has not reported its permissions yet (still starting?)"
     fix "wait ~10 s and run this again"
 else
-    if grep -q "event tap active" <<<"$block"; then
-        # The tap is what the hotkeys need; Accessibility alone can be
-        # enough for it, so this, not the Input Monitoring flag, decides.
+    # "event tap active" alone proves nothing: without Input Monitoring
+    # macOS hands out the tap anyway, blind to every key.
+    if grep -q "input monitoring trusted: True" <<<"$block" &&
+       grep -q "event tap active" <<<"$block"; then
         ok "hotkeys listening (Input Monitoring)"
     else
         bad "hotkeys off: Input Monitoring is not on"
@@ -114,25 +127,23 @@ if grep -q "microphone permission trusted: True" <<<"$block"; then
     ok "Microphone"
 elif grep -q "Microphone permission is denied" <<<"$block"; then
     bad "Microphone is blocked"
-    fix "System Settings → Privacy & Security → Microphone → turn on Python"
+    fix "System Settings → Privacy & Security → Microphone → turn on OpenSpeaksy"
     [[ $OPEN_PANES == 1 ]] && open "$PANE_MIC"
 else
-    warn "Microphone not asked yet: on the first dictation macOS asks, click Allow"
+    warn "Microphone not answered yet: when macOS asks, click Allow"
 fi
 
 if (( need_input || need_access )); then
     echo
     echo "  To fix: System Settings → Privacy & Security →"
-    (( need_input ))  && echo "    • Input Monitoring → turn ON the entry named Python (or python3.x; if two, both)"
+    (( need_input ))  && echo "    • Input Monitoring"
     (( need_access )) && echo "    • Accessibility (on the newest macOS: Device Control and Data Access)"
-    (( need_access )) && echo "      → turn ON the entry named Python (or python3.x; if two, both)"
-    echo "  The app has already asked macOS, so Python is in those lists; it only"
-    echo "  needs switching on."
-    (( need_access )) && echo "  Once Accessibility is on, the app restarts by itself within seconds."
-    if [[ -n "$REAL_PYTHON" ]]; then
-        echo "  If Python is not listed, click + and pick this file (⇧⌘G pastes a path):"
-        echo "    $REAL_PYTHON"
-    fi
+    echo "    → turn ON the switch next to OpenSpeaksy."
+    echo "  The app asks for one at a time and is already in that list: it only"
+    echo "  needs switching on. It restarts by itself within seconds and then"
+    echo "  asks for the next one."
+    echo "  If OpenSpeaksy is not listed, click + and pick (⇧⌘G pastes a path):"
+    echo "    $APP"
     if [[ $OPEN_PANES == 1 ]]; then
         # One pane at a time: a second open replaces the first. Run again
         # after this one is done for the next.

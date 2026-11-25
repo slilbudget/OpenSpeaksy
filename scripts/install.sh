@@ -2,7 +2,8 @@
 #
 # OpenSpeaksy installer for macOS.
 #
-# Sets up the Python venv and the LaunchAgent that runs main.py.
+# Sets up the Python venv, builds OpenSpeaksy.app (the launcher macOS asks
+# permissions for) and the LaunchAgent that runs main.py through it.
 # Requires a Mistral API key and writes it into the plist's
 # EnvironmentVariables. Mistral handles both speech-to-text and translation.
 #
@@ -79,6 +80,14 @@ pip install --quiet --upgrade pip
 pip install --quiet -r requirements.txt
 deactivate
 
+# --- app --------------------------------------------------------------------
+
+step "Building OpenSpeaksy.app"
+# Kept as is when its sources did not change: a rebuilt app would lose the
+# switches already turned on for it.
+xcode-select -p &>/dev/null || fail "Xcode Command Line Tools missing: run xcode-select --install, then this again"
+"$PROJECT_ROOT/scripts/build_app.sh" >/dev/null
+
 # --- LaunchAgent ------------------------------------------------------------
 
 step "Generating LaunchAgent plist"
@@ -135,16 +144,17 @@ launchctl load   "$LAUNCH_AGENTS/${LABEL_APP}.plist"
 
 printf "\n\033[1;32m✓ OpenSpeaksy installed.\033[0m\n\n"
 cat <<EOF
-Next: three switches in System Settings → Privacy & Security.
-The app has already asked macOS for them, so each list has an entry
-named "Python" (or python3.x): turn it ON (if there are two, both).
+Next: macOS asks three things, one after the other.
 
-  • Input Monitoring  → Python   (the hotkeys)
-  • Accessibility     → Python   (pasting the text; without it, text is only copied)
-    (on the newest macOS this pane is called Device Control and Data Access)
-  • Microphone        → asked on your first dictation: click Allow
+  1. The microphone: click Allow.
+  2. "OpenSpeaksy would like to receive keystrokes": click
+     Open System Settings, turn ON the switch next to OpenSpeaksy.
+  3. "OpenSpeaksy would like to control this computer": the same,
+     Open System Settings, turn ON OpenSpeaksy.
+     (On the newest macOS that pane is called Device Control and Data Access.)
 
-The app restarts by itself once Accessibility is on. Then check:
+After each switch the app restarts by itself and asks the next one.
+To check:
 
   "$PROJECT_ROOT/scripts/doctor.sh"
 
@@ -168,13 +178,16 @@ and re-run: launchctl unload ... && launchctl load ...
 EOF
 
 # Wait (up to 20 s) for the app to start and log what macOS granted, then
-# show where things stand and open the pane that still needs a switch.
+# show where things stand. No --open here: the app's own prompt offers to
+# open System Settings, and a second window would only compete with it.
 APP_LOG="$HOME/Library/Logs/${LABEL_APP}/main.log"
 for _ in $(seq 1 20); do
-    started="$(grep -n "OpenSpeaksy starting" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1)"
-    reported="$(grep -n "post events trusted:" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1)"
+    # || true: no log yet (or no match) is the normal first answer, and
+    # under set -e with pipefail it would end the script right here.
+    started="$(grep -n "OpenSpeaksy starting" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
+    reported="$(grep -n "post events trusted:" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
     [[ -n "$started" && -n "$reported" && "$reported" -gt "$started" ]] && break
     sleep 1
 done
 echo
-"$PROJECT_ROOT/scripts/doctor.sh" --open || true
+"$PROJECT_ROOT/scripts/doctor.sh" || true

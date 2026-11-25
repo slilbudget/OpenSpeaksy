@@ -112,3 +112,42 @@ def test_transient_stream_creation_failure_is_retried(monkeypatch):
     assert calls["count"] == 2
     assert stream.started
     recorder.stop()
+
+
+def test_a_stream_that_never_stops_does_not_hold_the_audio(monkeypatch):
+    """Core Audio can deadlock in stop: the take keeps its audio, the caller
+    moves on, and the flag asks the app to restart."""
+    import threading
+
+    release = threading.Event()
+
+    class HangingStream(FakeStream):
+        def stop(self):
+            release.wait(5)                 # stuck inside Core Audio
+
+    stream = HangingStream()
+    monkeypatch.setattr(recorder_module.sd, "CoreAudioSettings", lambda **kw: None)
+    monkeypatch.setattr(recorder_module.sd, "InputStream", lambda **kw: stream)
+    monkeypatch.setattr(recorder_module, "STREAM_CLOSE_WAIT_SEC", 0.05)
+    recorder_module.audio_stuck.clear()
+
+    recorder = recorder_module.Recorder()
+    recorder.start()
+    recorder._callback(np.ones((160, 1), dtype="float32"), 160, None, None)
+    audio = recorder.stop()
+
+    assert len(audio) == 160
+    assert recorder_module.audio_stuck.is_set()
+    release.set()
+    recorder_module.audio_stuck.clear()
+
+
+def test_a_normal_stop_is_not_stuck(monkeypatch):
+    stream = FakeStream()
+    monkeypatch.setattr(recorder_module.sd, "CoreAudioSettings", lambda **kw: None)
+    monkeypatch.setattr(recorder_module.sd, "InputStream", lambda **kw: stream)
+    recorder_module.audio_stuck.clear()
+    recorder = recorder_module.Recorder()
+    recorder.start()
+    recorder.stop()
+    assert stream.closed and not recorder_module.audio_stuck.is_set()

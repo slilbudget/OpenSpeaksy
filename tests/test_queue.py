@@ -732,6 +732,8 @@ def test_the_microphone_request_moves_on_once(monkeypatch):
     monkeypatch.setattr(main, "log", lines.append)
     monkeypatch.setattr(main.objc, "lookUpClass", lambda name: _FakeCaptureDevice)
     monkeypatch.setattr(main, "MICROPHONE_PROMPT_WAIT_SEC", 0.05)
+    hops = []                               # the next prompt goes to the main thread
+    monkeypatch.setattr(main.AppHelper, "callAfter", lambda fn: (hops.append(fn), fn()))
 
     _FakeCaptureDevice.answer = True
     main.request_microphone(lambda: calls.append("next"))
@@ -754,6 +756,7 @@ def test_the_microphone_request_moves_on_once(monkeypatch):
     assert calls == ["next"]
 
     # No AVFoundation: move straight on.
+    assert len(hops) == 3                   # every path went through the main thread
     calls.clear()
     def missing(name):
         raise main.objc.error("no AVCaptureDevice")
@@ -762,7 +765,7 @@ def test_the_microphone_request_moves_on_once(monkeypatch):
     assert calls == ["next"]
 
 
-class _Exit(Exception):
+class _Exit(BaseException):      # like os._exit, no `except Exception` stops it
     pass
 
 
@@ -811,6 +814,75 @@ def test_a_late_input_monitoring_grant_restarts_the_app(monkeypatch):
     monkeypatch.setattr(main, "_paste_allowed", lambda: False)
     exits, sleeps = _watch(monkeypatch, False, False)
     assert exits == [3] and len(sleeps) == 3
+
+
+def test_the_restart_waits_for_a_drain_in_flight(monkeypatch):
+    """The drain empties _jobs before it pastes and deletes: hold off."""
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_paste_allowed", lambda: True)
+    monkeypatch.setattr(main, "state", "idle")
+    exits = _record_exits(monkeypatch)
+    ticks = []
+
+    def sleep(_s):
+        ticks.append(1)
+        if len(ticks) == 1:
+            assert main._clipboard_gate.acquire(blocking=False)   # a drain starts
+            threading.Timer(0.2, main._clipboard_gate.release).start()
+        if len(ticks) > 3:
+            raise AssertionError("never restarted")
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    with pytest.raises(_Exit):
+        main.permission_watch_loop(True, False)
+    assert exits == [3]
+    assert main._clipboard_gate.acquire(blocking=False)   # released after the drain
+    main._clipboard_gate.release()
+
+
+def test_a_process_refused_at_start_copies_until_it_restarts(monkeypatch):
+    posted = []
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "copy_to_clipboard", lambda t: None)
+    monkeypatch.setattr(main, "CGEventPost", lambda *a: posted.append(a))
+    monkeypatch.setattr(main, "_paste_refused_at_start", True)
+    assert main.paste_text("x") is False and posted == []
+    monkeypatch.setattr(main, "_paste_refused_at_start", False)
+    monkeypatch.setattr(main.time, "sleep", lambda s: None)
+    assert main.paste_text("x") is True and len(posted) == 2
+
+
+def test_stuck_audio_restarts_the_app_once_idle(monkeypatch):
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_watchdog_tick", lambda: None)
+    exits = _record_exits(monkeypatch)
+    main.audio_stuck.set()
+    sleeps = []
+
+    def sleep(_s):
+        sleeps.append(1)
+        if len(sleeps) == 2:
+            main.state = "idle"             # the take finished
+        if len(sleeps) > 3:
+            raise AssertionError("never restarted")
+
+    monkeypatch.setattr(main.time, "sleep", sleep)
+    monkeypatch.setattr(main, "state", "recording")
+    with pytest.raises(_Exit):
+        main.watchdog_loop()
+    assert exits == [4] and len(sleeps) == 2
+
+
+def test_no_new_recording_while_the_audio_is_stuck(monkeypatch):
+    started, flashes = [], []
+    monkeypatch.setattr(main, "log", lambda m: None)
+    monkeypatch.setattr(main, "_microphone_access_is_blocked", lambda: False)
+    monkeypatch.setattr(main.recorder, "start", lambda: started.append(1))
+    monkeypatch.setattr(main.overlay, "flash_error", flashes.append)
+    main.audio_stuck.set()
+    main.on_key_down(main.HOTKEY_KEYCODE, main.MODE_DICTATE)
+    assert started == [] and flashes == ["Audio restarting"]
+    assert main.state == "idle"
 
 
 def test_the_watch_ends_when_nothing_is_missing(monkeypatch):

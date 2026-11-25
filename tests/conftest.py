@@ -61,3 +61,4 @@ def _clear(main):
     main._drain_recheck_armed = False
     main._held_since = None
     main._recovered_text.clear()
+    main.audio_stuck.clear()

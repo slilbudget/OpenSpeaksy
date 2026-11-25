@@ -27,6 +27,10 @@
         <key>OPENSPEAKSY_DICTATE_LANGUAGE</key>
         <string></string>
     </dict>
+    <!-- Without it launchd treats the agent as background work and throttles
+         its timers to ~20 irregular frames a second: the pill stutters. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
     <key>RunAtLoad</key>
     <true/>
     <!-- Restart on a crash or a launchctl stop, but NOT after a clean exit:

@@ -9,6 +9,17 @@ logger = logging.getLogger("openspeaksy")
 
 START_MAX_ATTEMPTS = 2
 START_RETRY_DELAY_SEC = 0.1
+# How long stop() waits for Core Audio to let go of the stream. Normally a
+# few milliseconds; see Recorder.stuck for when it never does.
+STREAM_CLOSE_WAIT_SEC = 2.0
+
+# Set when a stream never finished closing. Stopping a Core Audio input can
+# deadlock inside the system (seen live: the caller stuck in
+# AudioOutputUnitStop on a HAL mutex, Core Audio's IO thread stuck in
+# PortAudio's start/stop listener waiting for the AudioUnit). The close runs
+# on its own thread so the audio is never held hostage; the app restarts once
+# idle (main.py), since that Core Audio state does not recover.
+audio_stuck = threading.Event()
 
 
 class Recorder:
@@ -41,6 +52,28 @@ class Recorder:
         except Exception as e:
             logger.error(f"{context} stream close error: {e}")
 
+    def _close_aside(self, stream, context):
+        """
+        Close the stream on its own thread and wait up to
+        STREAM_CLOSE_WAIT_SEC. Returns whether it closed; if not, the thread
+        stays blocked where Core Audio holds it, and audio_stuck is set.
+        """
+        closed = threading.Event()
+
+        def close():
+            self._close_stream(stream, context)
+            closed.set()
+
+        threading.Thread(target=close, name="audio-close", daemon=True).start()
+        if closed.wait(STREAM_CLOSE_WAIT_SEC):
+            return True
+        audio_stuck.set()
+        logger.error(
+            f"{context} stream did not stop within {STREAM_CLOSE_WAIT_SEC:g} s "
+            "(Core Audio stuck); continuing without it"
+        )
+        return False
+
     def start(self):
         # Defensive: clean up orphan stream if previous recording was abandoned
         # (watchdog reset, lost key-up event)
@@ -48,7 +81,7 @@ class Recorder:
             orphan = self._stream
             self._stream = None
         if orphan is not None:
-            self._close_stream(orphan, "orphan")
+            self._close_aside(orphan, "orphan")
 
         # Core Audio stays in shared mode: never change device parameters or
         # take exclusive ownership from FaceTime, browser calls, or recording
@@ -99,8 +132,9 @@ class Recorder:
         self._stream = None
         if stream is not None:
             # Device changes and Continuity/Bluetooth disconnects can make
-            # stop/close fail. Preserve already-captured audio regardless.
-            self._close_stream(stream, "recording")
+            # stop/close fail, or hang. Preserve already-captured audio
+            # regardless.
+            self._close_aside(stream, "recording")
 
         with self._lock:
             if self._chunks:

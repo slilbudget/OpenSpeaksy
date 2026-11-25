@@ -34,7 +34,7 @@ from CoreFoundation import (
 )
 from PyObjCTools import AppHelper
 
-from recorder import Recorder
+from recorder import Recorder, audio_stuck
 from transcriber import (
     is_capacity_shortage,
     loudest_frame_rms,
@@ -214,10 +214,23 @@ def _open_instance_lock(lock_path):
     return lock_file
 
 
+INSTANCE_LOCK_WAIT_SEC = 5
+
+
 def _acquire_instance_lock():
+    """
+    Wait a little for the lock: right after a restart (a permission grant,
+    or install.sh's unload/load) the previous process may still be on its
+    way out, and giving up at once would exit 0, which launchd never
+    relaunches.
+    """
     global _instance_lock_file
-    _instance_lock_file = _open_instance_lock(INSTANCE_LOCK_PATH)
-    return _instance_lock_file is not None
+    deadline = time.monotonic() + INSTANCE_LOCK_WAIT_SEC
+    while True:
+        _instance_lock_file = _open_instance_lock(INSTANCE_LOCK_PATH)
+        if _instance_lock_file is not None or time.monotonic() >= deadline:
+            return _instance_lock_file is not None
+        time.sleep(0.25)
 
 
 def microphone_authorization_status():
@@ -258,13 +271,18 @@ def request_microphone(then):
     instead of on the first dictation, then call `then` once: when the user
     has answered, or after MICROPHONE_PROMPT_WAIT_SEC if they leave the prompt
     open (it would otherwise stack with the next one). Any failure to ask
-    just calls `then`: recording asks again by itself.
+    just calls `then`: recording asks again by itself. `then` runs on the
+    main thread: the answer arrives on an AVFoundation queue, and the next
+    permission prompt asked from there may never show.
     """
     once = threading.Lock()
+    timer = None
 
     def proceed(*_):
         if once.acquire(blocking=False):
-            then()
+            if timer is not None:
+                timer.cancel()
+            AppHelper.callAfter(then)
 
     def answered(granted):
         if granted:
@@ -507,11 +525,29 @@ def _watchdog_tick():
         on_key_up(finish_keycode)
 
 
+def _exit_when_idle(code, reason):
+    """
+    Exit (for launchd to start the app again) if nothing is live; return if
+    something is. Under both locks, in the drain's order: a drain takes the
+    jobs out of _jobs before it pastes and deletes their files, so an empty
+    _jobs alone does not mean nothing is in flight.
+    """
+    with _clipboard_gate:
+        with state_lock:
+            if state == "idle" and not _jobs:
+                log(reason)
+                os._exit(code)
+
+
 def watchdog_loop():
     while True:
         time.sleep(WATCHDOG_POLL_SEC)
         try:
             _watchdog_tick()
+            if audio_stuck.is_set():
+                # The take already has its audio; a fresh process gets a
+                # fresh Core Audio. Nonzero, so launchd starts it again.
+                _exit_when_idle(4, "audio input stuck; restarting")
         except Exception as e:
             log(f"watchdog loop error: {e}")
 
@@ -610,6 +646,12 @@ def _listen_allowed():
     return bool(CGPreflightListenEventAccess())
 
 
+# Set at start when Accessibility was off. A grant made since is seen live,
+# but this process's ⌘V may still go nowhere until permission_watch_loop
+# restarts it, so until then the text is copied, not "pasted" into a void.
+_paste_refused_at_start = False
+
+
 def paste_text(text):
     """
     Copy, then ⌘V. False when the ⌘V was not posted; the text is on the
@@ -619,7 +661,7 @@ def paste_text(text):
     try:
         _settle_clipboard()
         copy_to_clipboard(text)
-        if not _paste_allowed():
+        if _paste_refused_at_start or not _paste_allowed():
             log("paste blocked: Accessibility permission is not trusted")
             return False
         time.sleep(0.05)
@@ -1470,6 +1512,13 @@ def on_key_down(keycode, mode, hands_free=False):
         _abandon_recording_cycle()
         overlay.flash_error("Mic blocked")
         return
+    if audio_stuck.is_set():
+        # Opening the input again could hang this thread, the one that hears
+        # the keys; the app restarts as soon as the takes in flight are done.
+        log("recording refused: audio input stuck, restart pending")
+        _abandon_recording_cycle()
+        overlay.flash_error("Audio restarting")
+        return
     try:
         recorder.start()
         log(f"recording started: mode={mode}{'; hands-free' if hands_free else ''}")
@@ -1687,6 +1736,10 @@ def on_dictate_key(keycode, pressed, other_held):
         if stop_pressed_at is not None:
             if not _other_input_since(stop_pressed_at):
                 _finish_hands_free()
+            else:
+                # Said out loud, or a stop that seems to do nothing cannot be
+                # told from a lost key event.
+                log("hands-free stop tap ignored: a key or click came during it")
         elif started_at is not None and _other_input_since(started_at):
             # A key went down while the combination was held, so it was an
             # Option + Command shortcut, not a request to dictate.
@@ -1839,14 +1892,8 @@ def permission_watch_loop(listen_at_start, post_at_start):
         return
     while True:
         time.sleep(PERMISSION_POLL_SEC)
-        if not _restart_due(listen_at_start, post_at_start):
-            continue
-        with state_lock:
-            busy = state != "idle" or bool(_jobs)
-        if busy:
-            continue
-        log("permission granted; restarting to pick it up")
-        os._exit(3)
+        if _restart_due(listen_at_start, post_at_start):
+            _exit_when_idle(3, "permission granted; restarting to pick it up")
 
 
 def run_event_tap():
@@ -1900,6 +1947,7 @@ def configuration_error():
 
 
 def main():
+    global _paste_refused_at_start
     # Private-by-default for logs, pending recordings, and any future files.
     os.umask(0o077)
     _install_file_handler()
@@ -1947,6 +1995,7 @@ def main():
     recover_pending_recordings()
 
     listen, post = request_permissions()
+    _paste_refused_at_start = not post
     threading.Thread(
         target=permission_watch_loop, args=(listen, post), daemon=True
     ).start()

@@ -66,7 +66,7 @@ EOF
     echo
 fi
 [[ -n "$MISTRAL_API_KEY" ]] || fail "no Mistral API key provided"
-note "Got Mistral key ending in ...${MISTRAL_API_KEY: -4}"
+note "Got the Mistral key"
 
 # --- main app venv ----------------------------------------------------------
 
@@ -83,10 +83,17 @@ deactivate
 # --- app --------------------------------------------------------------------
 
 step "Building OpenSpeaksy.app"
-# Kept as is when its sources did not change: a rebuilt app would lose the
-# switches already turned on for it.
-xcode-select -p &>/dev/null || fail "Xcode Command Line Tools missing: run xcode-select --install, then this again"
-"$PROJECT_ROOT/scripts/build_app.sh" >/dev/null
+# Kept as is when its sources did not change. A new build is a new identity
+# to macOS: switches turned on for the old one no longer apply, though they
+# still show as on. Clear them, so the app asks again and the user sees
+# exactly what to turn on.
+had_app=0
+[[ -d "$PROJECT_ROOT/OpenSpeaksy.app" ]] && had_app=1
+built="$("$PROJECT_ROOT/scripts/build_app.sh")" || fail "could not build OpenSpeaksy.app (see above)"
+if [[ "$built" == built* && $had_app == 1 ]]; then
+    tccutil reset All com.openspeaksy >/dev/null 2>&1 || true
+    note "The app changed: macOS will ask for its permissions again"
+fi
 
 # --- LaunchAgent ------------------------------------------------------------
 
@@ -137,6 +144,10 @@ os.replace(tmp, target)
 PYEOF
 
 step "Loading LaunchAgent"
+APP_LOG="$HOME/Library/Logs/${LABEL_APP}/main.log"
+# Where this start's lines begin: the wait below must not take an earlier
+# run's lines for this one.
+log_before="$( (wc -l < "$APP_LOG") 2>/dev/null || echo 0)"
 launchctl unload "$LAUNCH_AGENTS/${LABEL_APP}.plist" 2>/dev/null || true
 launchctl load   "$LAUNCH_AGENTS/${LABEL_APP}.plist"
 
@@ -153,7 +164,8 @@ Next: macOS asks three things, one after the other.
      Open System Settings, turn ON OpenSpeaksy.
      (On the newest macOS that pane is called Device Control and Data Access.)
 
-After each switch the app restarts by itself and asks the next one.
+After each switch the app restarts by itself and asks the next one, if any.
+(If the microphone was allowed before, that first one is skipped.)
 To check:
 
   "$PROJECT_ROOT/scripts/doctor.sh"
@@ -180,13 +192,13 @@ EOF
 # Wait (up to 20 s) for the app to start and log what macOS granted, then
 # show where things stand. No --open here: the app's own prompt offers to
 # open System Settings, and a second window would only compete with it.
-APP_LOG="$HOME/Library/Logs/${LABEL_APP}/main.log"
 for _ in $(seq 1 20); do
     # || true: no log yet (or no match) is the normal first answer, and
     # under set -e with pipefail it would end the script right here.
     started="$(grep -n "OpenSpeaksy starting" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
     reported="$(grep -n "post events trusted:" "$APP_LOG" 2>/dev/null | tail -1 | cut -d: -f1 || true)"
-    [[ -n "$started" && -n "$reported" && "$reported" -gt "$started" ]] && break
+    [[ -n "$started" && -n "$reported" && "$started" -gt "$log_before" &&
+       "$reported" -gt "$started" ]] && break
     sleep 1
 done
 echo

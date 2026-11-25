@@ -20,7 +20,7 @@ Open-source speech-to-text for macOS, built on [Mistral](https://mistral.ai), wi
 | Hold **right ⇧** | Speak Russian, paste English |
 | **Caps Lock** | Cancel a transcription stuck for over 10 s. The audio is kept; tap twice to retry it now |
 
-Start the next take while the last one is still transcribing: they paste in the order you spoke. Text is pasted at the cursor and stays in the clipboard; if it can't be pasted, the pill says **Copied · ⌘V**.
+Start the next take while the last one is still transcribing: they paste in the order you spoke. Text is pasted at the cursor and stays in the clipboard; if it can't be pasted, the pill says **Copied · ⌘V** (or **Copied · allow Accessibility** while that switch is off).
 
 ## Install
 
@@ -40,7 +40,7 @@ git clone https://github.com/slilbudget/OpenSpeaksy.git ~/OpenSpeaksy
 cd ~/OpenSpeaksy && ./scripts/install.sh
 ```
 
-Then, either way, macOS asks three times, one after the other: **Allow** the microphone; then twice **Open System Settings** → turn on **OpenSpeaksy** (Input Monitoring for the keys, then Accessibility for the pasting; on the newest macOS: *Device Control and Data Access*). After each switch the app restarts itself. `./scripts/doctor.sh` checks it all and says what's missing.
+Then, either way, macOS asks up to three times, one after the other: **Allow** the microphone; then twice **Open System Settings** → turn on **OpenSpeaksy**: Input Monitoring for the keys, then Accessibility for the pasting (on the newest macOS Accessibility is called *Device Control and Data Access*). After each switch the app restarts itself. `./scripts/doctor.sh` checks it all and says what's missing.
 
 ## Settings
 

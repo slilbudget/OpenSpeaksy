@@ -9,8 +9,9 @@
 # a newer compiler would turn the switches the user flipped off again. The
 # sources travel inside the bundle (sealed by the signature) to compare with.
 #
-# Usage: ./scripts/build_app.sh     prints the app's path
-# Needs: clang (Xcode Command Line Tools; Homebrew installs them)
+# Usage: ./scripts/build_app.sh     prints "kept" or "built", then the path
+# Needs: clang (Xcode Command Line Tools; Homebrew installs them), only when
+#        the app has to be built
 
 set -euo pipefail
 
@@ -27,11 +28,13 @@ up_to_date() {
 }
 
 if up_to_date; then
-    echo "$APP"
+    echo "kept $APP"
     exit 0
 fi
 
-command -v clang &>/dev/null || {
+# Not `command -v clang`: /usr/bin/clang is a shim that exists even without
+# the Command Line Tools (and pops up their installer when run).
+xcrun --find clang &>/dev/null || {
     echo "clang not found: run xcode-select --install, then this again" >&2
     exit 1
 }
@@ -43,9 +46,9 @@ mkdir -p "$BUILD/Contents/MacOS" "$BUILD/Contents/Resources"
 cp "$SRC/Info.plist" "$BUILD/Contents/Info.plist"
 cp "$SRC/launcher.c" "$SRC/OpenSpeaksy.icns" "$BUILD/Contents/Resources/"
 clang -Os -Wall -o "$BUILD/Contents/MacOS/OpenSpeaksy" "$SRC/launcher.c"
-codesign --sign - --force --identifier com.openspeaksy "$BUILD" >/dev/null 2>&1
+codesign --sign - --force --identifier com.openspeaksy "$BUILD" >/dev/null
 codesign --verify "$BUILD"
 
 rm -rf "$APP"
 mv "$BUILD" "$APP"
-echo "$APP"
+echo "built $APP"

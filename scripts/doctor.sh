@@ -54,8 +54,13 @@ if [[ -f "$PLIST" ]]; then
     ok "LaunchAgent installed"
     runs="$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:0" "$PLIST" 2>/dev/null || true)"
     if [[ "$runs" != "$APP/Contents/MacOS/OpenSpeaksy" ]]; then
-        bad "the LaunchAgent starts Python directly (an install from before 1.5)"
-        fix "run ./scripts/install.sh again: permissions then show as OpenSpeaksy"
+        if [[ "$runs" == */OpenSpeaksy.app/Contents/MacOS/OpenSpeaksy ]]; then
+            bad "the LaunchAgent starts an OpenSpeaksy.app elsewhere: $runs"
+            fix "the project moved; run ./scripts/install.sh from here"
+        else
+            bad "the LaunchAgent starts Python directly (an install from before 1.5)"
+            fix "run ./scripts/install.sh again: permissions then show as OpenSpeaksy"
+        fi
     fi
     unset runs
     key="$(/usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:MISTRAL_API_KEY" "$PLIST" 2>/dev/null || true)"
@@ -71,14 +76,17 @@ else
     fix "run ./scripts/install.sh"
 fi
 
-loaded="$(launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l {print "yes"}')"
-pid="$(launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l {print $1}')"
+row="$(launchctl list 2>/dev/null | awk -v l="$LABEL" '$3 == l {print $1}')"
+loaded="${row:+yes}"
+pid="$row"
 if [[ -n "$pid" && "$pid" != "-" ]]; then
     ok "app running (pid $pid)"
 elif [[ -n "$loaded" ]]; then
-    # Loaded but between runs: launchd relaunches it every few seconds, which
-    # is what a missing Input Monitoring grant looks like (see below).
-    warn "app loaded but restarting (launchd retries every few seconds)"
+    # Loaded but between runs. A restart after a permission grant passes in
+    # seconds; if it stays like this, the app keeps dying before it logs, and
+    # the log below still shows an older, healthy start.
+    bad "app not running right now (launchd restarts it)"
+    fix "wait ~10 s and run this again; if it stays, see ~/Library/Logs/com.openspeaksy/stdout.log"
 else
     bad "app not running"
     fix "launchctl load $PLIST  (then wait a few seconds and run this again)"
@@ -130,7 +138,8 @@ elif grep -q "Microphone permission is denied" <<<"$block"; then
     fix "System Settings → Privacy & Security → Microphone → turn on OpenSpeaksy"
     [[ $OPEN_PANES == 1 ]] && open "$PANE_MIC"
 else
-    warn "Microphone not answered yet: when macOS asks, click Allow"
+    bad "Microphone not answered yet"
+    fix "click Allow in the macOS dialog (or turn on OpenSpeaksy in Microphone)"
 fi
 
 if (( need_input || need_access )); then

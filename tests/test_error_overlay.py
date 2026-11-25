@@ -305,8 +305,7 @@ def _split_rig(monkeypatch):
     view = o.OverlayView.alloc().initWithFrame_(NSMakeRect(0, 0, o.PANEL_W, o.PANEL_H))
 
     def show(mode, queued=0):
-        view.setQueued_(queued)                 # the order Overlay._show uses
-        view.setMode_(mode)
+        view.setMode_queued_(mode, queued)      # as Overlay._show does
 
     def run(seconds):
         frames = []
@@ -336,6 +335,91 @@ def test_a_take_started_over_a_transcription_slides_the_spinner_aside(monkeypatc
     assert xs[-1] == -o.SPIN_SHIFT                  # settles in the cap
     bars = [next(d for d in f if d[0] == "bars")[2] for f in frames]
     assert bars[0] == 0.0 and bars[-1] == 1.0        # bars wait, then come in
+
+
+def test_the_first_frame_of_a_slide_keeps_the_spinner(monkeypatch):
+    """Drawn the instant the recording starts, before any tick: the spinner
+    stays where it was and the bars stay hidden (no one-frame flash)."""
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 1)
+    run(0.5)
+    drawn = []
+    monkeypatch.setattr(o.OverlayView, "_draw_spinner",
+                        lambda self, cx, cy, alpha, count, scale=1.0: drawn.append(("spin", alpha)))
+    monkeypatch.setattr(o.OverlayView, "_draw_bars",
+                        lambda self, cx, cy, alpha: drawn.append(("bars", alpha)))
+    show("recording", 1)
+    view._draw_overlay()
+    assert drawn == [("spin", 1.0), ("bars", 0.0)]
+
+
+def test_the_spinner_turns_at_the_same_speed_whatever_the_frame_rate(monkeypatch):
+    """A slow or late frame must not change the turn: it is per second."""
+    angles = []
+    for fps in (60, 20):
+        view, show, run = _split_rig(monkeypatch)
+        show("loading", 1)
+        clock = o.time
+        view.tick_(None)                       # first tick: no step yet
+        start = view._spin
+        for _ in range(fps // 2):              # half a second
+            o.time = type(clock)(monotonic=lambda t=clock.monotonic() + 1 / fps: t)
+            clock = o.time
+            view.tick_(None)
+        angles.append(round((view._spin - start) % 360.0, 6))
+    assert angles[0] == angles[1] == round(o.SPIN_DEG_PER_SEC / 2 % 360.0, 6)
+
+
+def test_a_fading_spinner_shows_the_count_it_last_had(monkeypatch):
+    """2 takes behind, then 1, then none: the fade-out shows no number,
+    and a later session does not inherit the old one."""
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 2)
+    show("recording", 2)
+    run(0.5)
+    show("recording", 1)
+    run(0.1)
+    show("recording", 0)
+    assert all(s[3] is None for s in _spins(run(0.4)) if s)
+
+    view.snapSplit_(0.0)                            # straight from 2 to none
+    show("loading", 2)
+    show("recording", 2)
+    run(0.5)
+    show("recording", 0)
+    assert [s[3] for s in _spins(run(0.1)) if s][0] == "2"
+
+    view.snapSplit_(0.0)                            # hidden, then a new session
+    show("recording", 1)
+    run(0.5)
+    show("recording", 0)
+    assert all(s[3] is None for s in _spins(run(0.4)) if s)
+
+
+def test_a_recording_ending_mid_fade_out_does_not_pop_the_spinner(monkeypatch):
+    """The take behind finished, then the key came up a moment later: the new
+    take's spinner starts in the middle, not at full strength in the cap."""
+    view, show, run = _split_rig(monkeypatch)
+    show("loading", 1)
+    show("recording", 1)
+    run(0.5)
+    show("recording", 0)                            # fading out of the cap
+    run(0.25)
+    show("loading", 1)
+    first = _spins(run(1 / 60))[0]
+    assert first[1] == 0.0 and first[2] == 1.0
+
+
+def test_a_faint_spinner_cut_short_restarts_in_the_middle(monkeypatch):
+    """A fade-in into the cap barely begun when the recording ends."""
+    view, show, run = _split_rig(monkeypatch)
+    show("recording", 0)
+    run(0.2)
+    show("recording", 1)                            # fades in, in place
+    run(0.05)
+    show("loading", 1)
+    first = _spins(run(1 / 60))[0]
+    assert first[1] == 0.0 and first[2] == 1.0
 
 
 def test_a_slide_that_reverses_fades_out_where_it_stopped(monkeypatch):

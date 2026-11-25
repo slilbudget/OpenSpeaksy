@@ -90,6 +90,11 @@ BORDER_W = 1.0
 # sits inside the spinner.
 SPLIT_W = 10.0             # extra width of the split pill
 SPIN_R = 7.5               # spinner radius, the same in both places
+# Glyph motion per second, not per frame, so a late frame never changes the
+# speed or knocks the spinner's turn off its rhythm.
+SPIN_DEG_PER_SEC = 240.0
+BARS_RAD_PER_SEC = 6.0
+MAX_FRAME_STEP = 0.1       # longest step taken at once (after a stall or a hide)
 SPIN_SHIFT = W / 2.0 + SPLIT_W / 2.0 - H / 2.0      # centre → left cap
 BARS_SHIFT = W / 2.0 + SPLIT_W / 2.0 - 26.0         # centre → right part
 COUNT_SIZE = 8.5
@@ -327,6 +332,7 @@ class OverlayView(NSView):
             # The spinner turns on its own clock, so it keeps spinning
             # smoothly when it moves from the side to the middle.
             self._spin = 0.0
+            self._last_tick = None
             # Split tween: 0 plain pill, 1 split (see SPLIT_W).
             self._split = 0.0
             self._split_from = 0.0
@@ -361,34 +367,45 @@ class OverlayView(NSView):
                     v.layer().setContentsScale_(scale)
         return self
 
-    def setMode_(self, mode):
-        if self._mode != mode:
-            previous = self._mode
-            self._mode = mode
+    def setMode_queued_(self, mode, queued):
+        """
+        Move to a new (mode, queued) in one step. Setting them one at a time
+        would pass through a state that never happened (the new count with
+        the old mode) and animate towards it.
+        """
+        if queued > 0:
+            # What a spinner fading out of the cap keeps showing: the count
+            # of the last takes it stood for, None for a single one.
+            self._last_count = _spinner_count("loading", queued)
+        if (mode, queued) == (self._mode, self._queued):
+            return
+        previous, was_split = self._mode, self._split_to
+        self._mode, self._queued = mode, queued
+        if mode != previous:
             self._phase = 0.0
-            if mode == "recording":
-                self._spin_slides = previous == "loading"
-            elif (
-                mode == "loading" and previous == "recording"
-                and not self._spin_slides and 0.0 < self._split < 1.0
-            ):
+        target = _split_target(mode, queued)
+        if mode == "recording" and target == 1.0 and was_split == 0.0:
+            # Takes behind a new recording: the transcription's spinner
+            # glides from the middle into the cap; one that was not on
+            # screen fades in there.
+            self._spin_slides = previous == "loading"
+        elif mode == "loading" and previous == "recording":
+            if was_split == 1.0 and not self._spin_slides and self._split < 1.0:
                 # The recording ended while its spinner was still fading into
-                # the cap: start the glide from the cap, not from mid-pill.
-                self._split = 1.0
-            self._retarget_split()
-            self._glyph.setNeedsDisplay_(True)
+                # the cap: glide from the cap if it was mostly there, else
+                # start in the middle rather than pop up at full strength.
+                self._split = 1.0 if self._split >= 0.5 else 0.0
+            elif was_split == 0.0:
+                # Plain pill, or a slide on its way back: the spinner of the
+                # take just recorded starts in the middle.
+                self._split = 0.0
+            self._spin_slides = False
+        self._retarget_split()
+        self._glyph.setNeedsDisplay_(True)
 
     def setLabel_(self, label):
         if self._label != label:
             self._label = label
-            self._glyph.setNeedsDisplay_(True)
-
-    def setQueued_(self, queued):
-        if self._queued != queued:
-            if self._mode == "recording" and self._queued == 0 and queued > 0:
-                self._spin_slides = False      # a take behind it: fade in
-            self._queued = queued
-            self._retarget_split()
             self._glyph.setNeedsDisplay_(True)
 
     def _retarget_split(self):
@@ -445,11 +462,14 @@ class OverlayView(NSView):
         self._animate_surface(_circle_frame(), EXPAND_OUT)
 
     def tick_(self, timer):
+        now = time.monotonic()
+        step = 0.0 if self._last_tick is None else min(now - self._last_tick, MAX_FRAME_STEP)
+        self._last_tick = now
         self._advance_split()
         if self._mode == "recording":
-            self._phase += 0.1
+            self._phase += BARS_RAD_PER_SEC * step
         if self._mode in ("recording", "loading"):
-            self._spin = (self._spin + 4.0) % 360.0
+            self._spin = (self._spin + SPIN_DEG_PER_SEC * step) % 360.0
             self._glyph.setNeedsDisplay_(True)
 
     def _draw_overlay(self):
@@ -494,14 +514,16 @@ class OverlayView(NSView):
         elif self._mode in ("recording", "loading"):
             _, spin_x, bars_x = _split_layout(self._split)
             count = _spinner_count(self._mode, self._queued)
-            if count is not None:
-                self._last_count = count
             if self._mode == "loading":
                 # The spinner, gliding back to the middle if it was in the cap.
                 self._draw_spinner(spin_x, cy, 1.0, count)
                 return
             bars_alpha = 1.0
-            if self._split > 0.0:
+            # _split_to too: the frame drawn the instant a split starts has
+            # _split still at exactly 0, and must already be the split's
+            # first frame (spinner in place, bars hidden), not the plain
+            # recording pill flashing up for a frame.
+            if self._split > 0.0 or self._split_to > 0.0:
                 fading = count or (self._last_count if self._split_to == 0.0 else None)
                 if self._spin_slides and self._split_to == 1.0:
                     # Sliding from the middle into the cap; the bars come in
@@ -725,14 +747,14 @@ class Overlay:
         fresh = self._timer is None          # hidden until now
         self._view.setLabel_(label)
         self._view.setMessage_(message)
-        self._view.setQueued_(queued)
-        self._view.setMode_(mode)
+        self._view.setMode_queued_(mode, queued)
         if fresh and not message:
             # Appearing from nothing: no tween from whatever it showed last.
             self._view.snapSplit_(_split_target(mode, queued))
 
         # The redraw timer runs only while the pill is visible.
         if self._timer is None:
+            self._view._last_tick = None         # no step across the hidden time
             self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 FPS, self._view, b"tick:", None, True
             )
